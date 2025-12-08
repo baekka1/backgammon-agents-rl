@@ -115,7 +115,7 @@ def _is_move_legal(state, player, from_point, to_point):
         if target_checkers <= -2:
             return False
 
-# Rule 4: If bearing off, must satisfy the Furthest Back (Clearance) Rule.
+    # Rule 4: If bearing off, must satisfy the Furthest Back (Clearance) Rule.
     # Check if there is any piece further back than the one being moved.
     if to_point == W_OFF or to_point == B_OFF:
         off_target = W_OFF if player == 1 else B_OFF
@@ -448,12 +448,11 @@ def _vectorized_actions_parallel(state_vector, player_vector, dice_vector):
     return actions, afterstates
 
 '''
-#@njit(parallel=True)
-@njit
+@njit(parallel=True)
 def _vectorized_apply_move(state_vector, player_vector, dice_vector, move_sequence_vector):
 
-    num_games = len(state_vector)
-    new_state_vector = np.empty((num_games, STATE_SIZE), dtype=np.int8)
+    new_state_vector = np.empty( len(state_vector), dtype=State )
+    
     for i in prange( len(state_vector) ):
         new_state_vector[i] = _apply_move( state_vector[i],
                                            player_vector[i],
@@ -522,11 +521,9 @@ def _action_to_array(action):
     Convert an Action (Numba List of (from_point, roll) int8 tuples)
     into a NumPy array of shape (k, 2) with dtype=int8.
     """
-    MAX_MOVES = 4
-
     n = len(action)
-    arr = np.full((MAX_MOVES, 2), -1, dtype=int8)
-    for i in range(min(n, MAX_MOVES)):
+    arr = np.empty((n, 2), dtype=int8)
+    for i in range(n):
         arr[i, 0] = action[i][0]
         arr[i, 1] = action[i][1]
     return arr
@@ -539,13 +536,6 @@ def _select_optimal_move( values, offsets, afterstate_dict ):
 
     afterstates = list(afterstate_dict)
     move_expected_values = np.zeros( len(afterstates), np.float64 )
-    num_moves = len(afterstates)
-    # PASS move definition
-    PASS_MOVE = np.full((4,2), -1, dtype=np.int8)
-
-    if num_moves == 0:
-        return PASS_MOVE
-
     for m in prange(len(afterstates)):
         d=0
         for r1 in range(1,7):
@@ -599,6 +589,7 @@ def _2_ply_search( state, player, dice, batch_value_function ):
 
 #@njit(parallel=True
 @njit
+@njit(parallel=True)
 def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
     # vectorized version which takes arrays of states, players, and
     # dice, and returns a 1d buffer of states, an array of offset
@@ -650,23 +641,17 @@ def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
 
 #@njit(parallel=True)
 @njit
+
+@njit(parallel=True)
 def _vectorized_select_optimal_move( final_values, final_offsets, final_player_moves,
                                      cumulative_state_counts ):
-
-    MAX_MOVES = 4
-    MOVE_FIELDS = 2
-    PASS_MOVE = np.full((4,2), -1, dtype=np.int8)
 
     batch_size = len(final_offsets)
     block_start = 0
     block_end = 0
-    optimal_moves = np.full((batch_size, MAX_MOVES, MOVE_FIELDS), -1, dtype=int8)
+    optimal_moves = np.empty( batch_size )
+    
     for i in prange(batch_size):
-        # If no afterstates exist → no legal moves
-        if cumulative_state_counts[i] == cumulative_state_counts[i+1]:
-            optimal_moves[i] = PASS_MOVE
-            continue
-
         optimal_move = _select_optimal_move(
             final_values[ cumulative_state_counts[i]
                           : cumulative_state_counts[i+1]],
