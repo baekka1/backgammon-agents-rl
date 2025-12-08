@@ -481,13 +481,18 @@ def _collect_search_data( state, player, dice ):
                 opponent_moves, opponent_afterstates = _actions( opponent_state,
                                                                  -player,
                                                                  opponent_dice )
-                opponent_afterstates = _unique_afterstates( opponent_moves,
+                if len(opponent_moves) == 0:
+                    # opponent cannot move; leaf is just opponent_state
+                    states_buffer.append(opponent_state)
+                    i += 1
+                else:
+                    opponent_afterstates = _unique_afterstates( opponent_moves,
                                                             opponent_afterstates )
                 
-                for opponent_afterstate in opponent_afterstates:
-                    opponent_afterstate = np.array( opponent_afterstate, dtype=int8 )
-                    states_buffer.append(opponent_afterstate)
-                    i += 1
+                    for opponent_afterstate in opponent_afterstates:
+                        opponent_afterstate = np.array( opponent_afterstate, dtype=int8 )
+                        states_buffer.append(opponent_afterstate)
+                        i += 1
         m += 1
 
     return states_buffer, offsets, afterstates_dict
