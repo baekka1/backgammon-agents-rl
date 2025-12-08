@@ -121,6 +121,7 @@ def _is_move_legal(state, player, from_point, to_point):
         off_target = W_OFF if player == 1 else B_OFF
         if to_point != off_target:
             return False
+
         # TELL PROF. MCTAGUE ABOUT THIS ERROR
         if not _can_bear_off(state, player):
             return False
@@ -323,6 +324,7 @@ def _find_moves_recursive(state, player, remaining_dice, current_move, all_moves
     # Base Case 1: All dice used
     if len(remaining_dice) == 0:
         all_moves.append( current_move )
+
         # all_moves is a list of lists, where each nested list is a list of tuples; eg. (5, 3) --> move from point 5 using die roll 3
         all_afterstates.append( state )
         return
@@ -530,6 +532,7 @@ def _action_to_array(action):
 
 #@njit(parallel=True)
 @njit
+
 def _select_optimal_move( values, offsets, afterstate_dict ):
     # receives an array of values for leaves of the 2-ply search and
     # selects the action which maximizes the expected value
@@ -560,9 +563,6 @@ def _select_optimal_move( values, offsets, afterstate_dict ):
     # return np.array(
     #     afterstate_dict[ afterstates[ np.argmax( move_expected_values ) ] ],
     #     dtype=int8 )
-    if np.all(np.isnan(move_expected_values)):
-        return PASS_MOVE
-
     best_afterstate = afterstates[np.argmax(move_expected_values)]
     best_action = afterstate_dict[best_afterstate]
     # Convert Action (Numba List of tuples) -> NumPy array (k, 2)
