@@ -121,7 +121,6 @@ def _is_move_legal(state, player, from_point, to_point):
         off_target = W_OFF if player == 1 else B_OFF
         if to_point != off_target:
             return False
-        # TELL PROF. MCTAGUE ABOUT THIS ERROR
         if not _can_bear_off(state, player):
             return False
         if player == 1:
@@ -289,10 +288,13 @@ def _state_to_tuple(a):
     # lmk! not only is this ugly, it generates a
     # "NumbaTypeSafetyWarning: unsafe cast from UniTuple(int64 x 28)
     # to UniTuple(int8 x 28). Precision may be lost."
-    return (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
-            a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16],
-            a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24],
-            a[25], a[26], a[27])
+    return ( int8(a[0]), int8(a[1]), int8(a[2]), int8(a[3]),
+             int8(a[4]), int8(a[5]), int8(a[6]), int8(a[7]),
+             int8(a[8]), int8(a[9]), int8(a[10]), int8(a[11]),
+             int8(a[12]), int8(a[13]), int8(a[14]), int8(a[15]),
+             int8(a[16]), int8(a[17]), int8(a[18]), int8(a[19]),
+             int8(a[20]), int8(a[21]), int8(a[22]), int8(a[23]),
+             int8(a[24]), int8(a[25]), int8(a[26]), int8(a[27]) )
 
 @njit
 def _unique_afterstates(moves, afterstates):
@@ -323,7 +325,6 @@ def _find_moves_recursive(state, player, remaining_dice, current_move, all_moves
     # Base Case 1: All dice used
     if len(remaining_dice) == 0:
         all_moves.append( current_move )
-        # all_moves is a list of lists, where each nested list is a list of tuples; eg. (5, 3) --> move from point 5 using die roll 3
         all_afterstates.append( state )
         return
 
@@ -462,7 +463,6 @@ def _collect_search_data( state, player, dice ):
     # tree for batch evaluation by the (neural network) value function
 
     player_moves, player_afterstates = _actions( state, player, dice )
-    print(f"[DEBUG] Root has {len(player_moves)} legal moves")
     afterstates_dict = _unique_afterstates(player_moves, player_afterstates)
     states_buffer = List.empty_list(state)
     offsets = np.empty( (len(afterstates_dict), NUM_SORTED_ROLLS), np.int64)
@@ -481,15 +481,14 @@ def _collect_search_data( state, player, dice ):
                 opponent_moves, opponent_afterstates = _actions( opponent_state,
                                                                  -player,
                                                                  opponent_dice )
-                print(f"[DEBUG] Opponent dice ({r1},{r2}) -> {len(opponent_moves)} moves")
                 if len(opponent_moves) == 0:
-                    # Forced pass: opponent cannot move; leaf is just opponent_state itself
+                    # opponent cannot move; leaf is just opponent_state
                     states_buffer.append(opponent_state)
                     i += 1
-                
                 else:
                     opponent_afterstates = _unique_afterstates( opponent_moves,
-                                                                opponent_afterstates )
+                                                            opponent_afterstates )
+                
                     for opponent_afterstate in opponent_afterstates:
                         opponent_afterstate = np.array( opponent_afterstate, dtype=int8 )
                         states_buffer.append(opponent_afterstate)
@@ -497,19 +496,6 @@ def _collect_search_data( state, player, dice ):
         m += 1
 
     return states_buffer, offsets, afterstates_dict
-
-@njit
-def _action_to_array(action):
-    """
-    Convert an Action (Numba List of (from_point, roll) int8 tuples)
-    into a NumPy array of shape (k, 2) with dtype=int8.
-    """
-    n = len(action)
-    arr = np.empty((n, 2), dtype=int8)
-    for i in range(n):
-        arr[i, 0] = action[i][0]
-        arr[i, 1] = action[i][1]
-    return arr
 
 @njit(parallel=True)
 def _select_optimal_move( values, offsets, afterstate_dict ):
@@ -532,21 +518,11 @@ def _select_optimal_move( values, offsets, afterstate_dict ):
                         end_index = offsets[ m+1, 0]
                     else:
                         end_index = len(values)
-                if end_index <= start_index:
-                    # No opponent afterstates for this dice roll -> skip this roll's contribution
-                    d += 1
-                    continue
                 minv = np.min( values[ start_index : end_index ] )
                 move_expected_values[m] += p * minv
                 d = d + 1
 
-    # return np.array(
-    #     afterstate_dict[ afterstates[ np.argmax( move_expected_values ) ] ],
-    #     dtype=int8 )
-    best_afterstate = afterstates[np.argmax(move_expected_values)]
-    best_action = afterstate_dict[best_afterstate]
-    # Convert Action (Numba List of tuples) -> NumPy array (k, 2)
-    return _action_to_array(best_action)
+    return afterstate_dict[ afterstates[ np.argmax( move_expected_values ) ] ]
 
 def _2_ply_search( state, player, dice, batch_value_function ):
     # this function calls into the numba code above from the python
@@ -557,7 +533,6 @@ def _2_ply_search( state, player, dice, batch_value_function ):
     # or numba array, in particular it is batch_value_function's job
     # to convert, from say a JAX array, to an array numba can work
     # with
-    print("[DEBUG] Starting 2-ply search...")
 
     state_buffer, offsets, player_moves = _collect_search_data( state,
                                                                 player,
@@ -646,7 +621,9 @@ def _vectorized_2_ply_search( state_vector, player_vector, dice_vector, batch_va
     # from say a JAX array.
 
     (fin_state_buffer, fin_offsets, fin_player_moves,
-     cum_state_counts) = _vectorized_collect_search_data( state, player, dice )
+     cum_state_counts) = _vectorized_collect_search_data( state_vector,
+                                                          player_vector,
+                                                          dice_vector )
 
     fin_value_buffer = batch_value_function( fin_state_buffer )
 
