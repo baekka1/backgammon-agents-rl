@@ -414,6 +414,46 @@ def td0_update(weights: np.ndarray,
     # In-place weight update
     weights += alpha * delta * phi_t
 
+def td0_batch_update(weights: np.ndarray,
+                     states_t: np.ndarray,      # shape (B, 28), int8
+                     rewards_tp1: np.ndarray,   # shape (B,), float
+                     states_tp1: np.ndarray,    # shape (B, 28), int8 (ignored for terminals)
+                     terminals: np.ndarray,     # shape (B,), bool or {0,1}
+                     alpha: float = ALPHA,
+                     gamma: float = GAMMA) -> None:
+    """
+    Vectorized TD(0) update using a *single* averaged target across the batch.
+    """
+    B = states_t.shape[0]
+
+    v_t = np.empty(B, dtype=np.float64)
+    targets = np.empty(B, dtype=np.float64)
+    phi_sum = np.zeros_like(weights, dtype=np.float64)
+
+    for i in range(B):
+        s_t = states_t[i]
+        v = value_white(weights, s_t)
+        v_t[i] = v
+
+        if terminals[i]:
+            target = rewards_tp1[i]
+        else:
+            s_tp1 = states_tp1[i]
+            v_tp1 = value_white(weights, s_tp1)
+            target = rewards_tp1[i] + gamma * v_tp1
+
+        targets[i] = target
+        phi_sum += feature_function(s_t)
+
+    target_bar = float(np.mean(targets))
+    v_bar = float(np.mean(v_t))
+    delta_bar = target_bar - v_bar
+
+    phi_bar = (phi_sum / B).astype(np.float32)
+
+    # In-place update with averaged target
+    weights += alpha * delta_bar * phi_bar
+
 # ==========================================
 # Play a single self-play game with TD(0)
 # ==========================================
@@ -502,3 +542,154 @@ def play_one_game_td0(weights: np.ndarray,
         state = next_state
         player = bge.Player(-player) # switch side to move
         dice = dice_next
+
+def play_batch_td0(weights: np.ndarray,
+                   batch_size: int,
+                   num_batches: int,
+                   alpha: float = ALPHA,
+                   gamma: float = GAMMA):
+    """
+    Vectorized TD(0) self-play:
+    - Maintains `batch_size` independent games in parallel.
+    - Each iteration ("batch move"):
+        * For each game i:
+            - choose a move via 2-ply search (using shared weights),
+            - apply the move to get s_{t+1}^i,
+            - get reward r_{t+1}^i (white's perspective),
+            - if terminal: immediately reset that game slot to a new game.
+        * Perform ONE TD(0) update on the shared weights using
+          the *averaged TD target across the whole batch*.
+    Arguments:
+        weights     : shared parameter vector (updated in-place)
+        batch_size  : number of games in parallel
+        num_batches : how many batch updates to perform
+        alpha, gamma: learning hyperparameters
+    """
+
+    global GAMMA, ALPHA
+    GAMMA = gamma
+    ALPHA = alpha
+
+    # --- Initialize batch of games using the engine's vectorized new_game ---
+    state_vector, player_vector, dice_vector = bge._vectorized_new_game(batch_size)
+    states = np.array(state_vector, dtype=np.int8)     # (B, 28)
+    players = np.array(player_vector, dtype=np.int8)   # (B,)
+    dice = np.array(dice_vector, dtype=np.int8)       # (B, 2)
+
+    # For logging
+    total_steps = 0
+    total_finished = 0
+
+    for batch_step in range(num_batches):
+        B = batch_size
+
+        # Progress logging every N batches
+        if batch_step % 50 == 0:
+            print(
+                f"[Batch {batch_step}/{num_batches}] "
+                f"total_steps={total_steps}, total_finished_games={total_finished}",
+                flush=True
+            )
+
+        # Save current states as s_t for the TD update
+        states_t = states.copy()                             # (B, 28)
+        rewards = np.zeros(B, dtype=np.float32)              # (B,)
+        next_states = np.zeros_like(states, dtype=np.int8)   # (B, 28)
+        terminals = np.zeros(B, dtype=bool)                  # (B,)
+
+        # ----- Step each game in the batch once -----
+        for i in range(B):
+            s = states[i]
+            p = int(players[i])
+            d = dice[i]
+
+            # Get legal moves for this game
+            moves, afterstates = bge._actions(s, p, d)
+
+            if len(moves) == 0:
+                # ----- FORCED PASS -----
+                # No legal moves: state does not change, turn passes to opponent.
+                reward_white = bge._reward(s, 1)
+                terminal = (reward_white != 0)
+
+                if terminal:
+                    # Terminal on a forced pass: do a terminal transition
+                    rewards[i] = float(reward_white)
+                    terminals[i] = True
+                    next_states[i] = s   # next_state is irrelevant here
+                    total_finished += 1
+
+                    # Immediately start a new game in this slot
+                    new_player, new_dice, new_state = bge._new_game()
+                    players[i] = int(new_player)
+                    dice[i] = np.array(new_dice, dtype=np.int8)
+                    states[i] = np.array(new_state, dtype=np.int8)
+                else:
+                    # Non-terminal forced pass: no TD update (state_t == state_{t+1})
+                    rewards[i] = 0.0
+                    terminals[i] = False
+                    next_states[i] = s
+
+                    # Flip player and roll dice for next turn
+                    players[i] = np.int8(-p)
+                    dice[i] = bge._roll_dice()
+                continue    # Move to the next game in the batch
+
+            # Choose a move with 2-ply search for this game
+            batch_v = make_linear_batch_value_function(weights, int(p))
+            move_seq = bge._2_ply_search(s, p, d, batch_v)
+
+            # Apply the move to get next state
+            s_next = bge._apply_move(s, p, move_seq)
+            s_next = np.array(s_next, dtype=np.int8)
+
+            # Compute reward from WHITE's perspective
+            reward_white = bge._reward(s_next, bge.Player(1))
+            terminal = (reward_white != 0)
+
+            rewards[i] = float(reward_white)
+            terminals[i] = terminal
+            next_states[i] = s_next
+
+            if terminal:
+                total_finished += 1
+                # Immediately start a new game in this slot
+                new_player, new_dice, new_state = bge._new_game()
+                players[i] = int(new_player)
+                dice[i] = np.array(new_dice, dtype=np.int8)
+                states[i] = np.array(new_state, dtype=np.int8)
+            else:
+                # Continue the same game: switch player and roll dice
+                players[i] = np.int8(-p)
+                dice[i] = bge._roll_dice()
+                states[i] = s_next
+
+            total_steps += 1
+
+        # ----- Perform a batch TD(0) update using the collected transitions -----
+        td0_batch_update(weights,
+                         states_t=states_t,
+                         rewards_tp1=rewards,
+                         states_tp1=next_states,
+                         terminals=terminals,
+                         alpha=alpha,
+                         gamma=gamma)
+
+    # Return statistics
+    return {
+        "total_steps": total_steps,
+        "total_finished_games": total_finished,
+        "weights": weights
+    }
+
+if __name__ == "__main__":
+    weights = init_weights()
+    result = play_batch_td0(weights,
+                            batch_size=32,
+                            num_batches=100,
+                            alpha=1e-3,
+                            gamma=1.0)
+    print("Finished batch training.")
+    print("Total steps:", result["total_steps"])
+    print("Total finished games:", result["total_finished_games"])
+    print("Weights (first 10):", result["weights"][:10])
