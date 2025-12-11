@@ -115,7 +115,7 @@ def _is_move_legal(state, player, from_point, to_point):
         if target_checkers <= -2:
             return False
 
-    # Rule 4: If bearing off, must satisfy the Furthest Back (Clearance) Rule.
+# Rule 4: If bearing off, must satisfy the Furthest Back (Clearance) Rule.
     # Check if there is any piece further back than the one being moved.
     if to_point == W_OFF or to_point == B_OFF:
         off_target = W_OFF if player == 1 else B_OFF
@@ -523,9 +523,11 @@ def _action_to_array(action):
     Convert an Action (Numba List of (from_point, roll) int8 tuples)
     into a NumPy array of shape (k, 2) with dtype=int8.
     """
+    MAX_MOVES = 4
+
     n = len(action)
-    arr = np.empty((n, 2), dtype=int8)
-    for i in range(n):
+    arr = np.full((MAX_MOVES, 2), -1, dtype=int8)
+    for i in range(min(n, MAX_MOVES)):
         arr[i, 0] = action[i][0]
         arr[i, 1] = action[i][1]
     return arr
@@ -646,10 +648,13 @@ def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
 def _vectorized_select_optimal_move( final_values, final_offsets, final_player_moves,
                                      cumulative_state_counts ):
 
+    MAX_MOVES = 4
+    MOVE_FIELDS = 2
+
     batch_size = len(final_offsets)
     block_start = 0
     block_end = 0
-    optimal_moves = np.empty( batch_size )
+    optimal_moves = np.full((batch_size, MAX_MOVES, MOVE_FIELDS), -1, dtype=int8)
     
     for i in prange(batch_size):
         optimal_move = _select_optimal_move(
