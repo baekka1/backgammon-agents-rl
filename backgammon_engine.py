@@ -399,7 +399,8 @@ def _to_canonical(state, player):
 
     return canonical_state
 
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _vectorized_new_game(num_games):
     player_vector = np.empty( num_games, dtype=int8 )
     dice_vector = np.empty( (num_games, NUM_DICE), dtype=int8) 
@@ -410,7 +411,8 @@ def _vectorized_new_game(num_games):
 
     return state_vector, player_vector, dice_vector
 
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _vectorized_roll_dice(num_games):
     rolls = np.random.randint(1,7,size=(num_games,2)).astype(np.int8)
     sorted_dice = np.empty_like(rolls)
@@ -426,7 +428,8 @@ def _vectorized_roll_dice(num_games):
             sorted_dice[i,1] = d1
     return sorted_dice
 
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _vectorized_actions_parallel(state_vector, player_vector, dice_vector):
     actions = List()
     afterstates = List()
@@ -444,17 +447,32 @@ def _vectorized_actions_parallel(state_vector, player_vector, dice_vector):
 
     return actions, afterstates
 
-@njit(parallel=True)
+'''
+#@njit(parallel=True)
+@njit
 def _vectorized_apply_move(state_vector, player_vector, dice_vector, move_sequence_vector):
 
-    new_state_vector = np.empty( len(state_vector), dtype=State )
-    
+    num_games = len(state_vector)
+    new_state_vector = np.empty((num_games, STATE_SIZE), dtype=np.int8)
     for i in prange( len(state_vector) ):
         new_state_vector[i] = _apply_move( state_vector[i],
                                            player_vector[i],
                                            dice_vector[i],
                                            move_sequence_vector[i] )
     return new_state_vector
+'''
+
+#njit(parallel=True)
+@njit
+def _vectorized_apply_move(states, players, move_sequences):
+
+    new_states = states.copy()
+
+    for i in prange( len(states) ):
+        new_states[i] = _apply_move( states[i],
+                                     players[i],
+                                     move_sequences[i] )
+    return new_states
 
 @njit
 def _collect_search_data( state, player, dice ):
@@ -462,7 +480,7 @@ def _collect_search_data( state, player, dice ):
     # tree for batch evaluation by the (neural network) value function
 
     player_moves, player_afterstates = _actions( state, player, dice )
-    print(f"[DEBUG] Root has {len(player_moves)} legal moves")
+    #print(f"[DEBUG] Root has {len(player_moves)} legal moves")
     afterstates_dict = _unique_afterstates(player_moves, player_afterstates)
     states_buffer = List.empty_list(state)
     offsets = np.empty( (len(afterstates_dict), NUM_SORTED_ROLLS), np.int64)
@@ -481,7 +499,7 @@ def _collect_search_data( state, player, dice ):
                 opponent_moves, opponent_afterstates = _actions( opponent_state,
                                                                  -player,
                                                                  opponent_dice )
-                print(f"[DEBUG] Opponent dice ({r1},{r2}) -> {len(opponent_moves)} moves")
+                #print(f"[DEBUG] Opponent dice ({r1},{r2}) -> {len(opponent_moves)} moves")
                 if len(opponent_moves) == 0:
                     # Forced pass: opponent cannot move; leaf is just opponent_state itself
                     states_buffer.append(opponent_state)
@@ -513,14 +531,21 @@ def _action_to_array(action):
         arr[i, 1] = action[i][1]
     return arr
 
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _select_optimal_move( values, offsets, afterstate_dict ):
     # receives an array of values for leaves of the 2-ply search and
     # selects the action which maximizes the expected value
 
     afterstates = list(afterstate_dict)
     move_expected_values = np.zeros( len(afterstates), np.float64 )
-    
+    num_moves = len(afterstates)
+    # PASS move definition
+    PASS_MOVE = np.full((4,2), -1, dtype=np.int8)
+
+    if num_moves == 0:
+        return PASS_MOVE
+
     for m in prange(len(afterstates)):
         d=0
         for r1 in range(1,7):
@@ -545,6 +570,9 @@ def _select_optimal_move( values, offsets, afterstate_dict ):
     # return np.array(
     #     afterstate_dict[ afterstates[ np.argmax( move_expected_values ) ] ],
     #     dtype=int8 )
+    if np.all(np.isnan(move_expected_values)):
+        return PASS_MOVE
+
     best_afterstate = afterstates[np.argmax(move_expected_values)]
     best_action = afterstate_dict[best_afterstate]
     # Convert Action (Numba List of tuples) -> NumPy array (k, 2)
@@ -569,7 +597,8 @@ def _2_ply_search( state, player, dice, batch_value_function ):
 
     return _select_optimal_move( value_buffer, offsets, player_moves )
 
-@njit(parallel=True)
+#@njit(parallel=True
+@njit
 def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
     # vectorized version which takes arrays of states, players, and
     # dice, and returns a 1d buffer of states, an array of offset
@@ -619,19 +648,25 @@ def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
     return final_states_buffer, final_offsets, final_player_moves, cumulative_state_counts
 
 
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _vectorized_select_optimal_move( final_values, final_offsets, final_player_moves,
                                      cumulative_state_counts ):
 
     MAX_MOVES = 4
     MOVE_FIELDS = 2
+    PASS_MOVE = np.full((4,2), -1, dtype=np.int8)
 
     batch_size = len(final_offsets)
     block_start = 0
     block_end = 0
     optimal_moves = np.full((batch_size, MAX_MOVES, MOVE_FIELDS), -1, dtype=int8)
-    
     for i in prange(batch_size):
+        # If no afterstates exist → no legal moves
+        if cumulative_state_counts[i] == cumulative_state_counts[i+1]:
+            optimal_moves[i] = PASS_MOVE
+            continue
+
         optimal_move = _select_optimal_move(
             final_values[ cumulative_state_counts[i]
                           : cumulative_state_counts[i+1]],
@@ -660,7 +695,8 @@ def _vectorized_2_ply_search( state_vector, player_vector, dice_vector, batch_va
     return _vectorized_select_optimal_move( fin_value_buffer,
                                             fin_offsets, fin_player_moves,
                                             cum_state_counts)
-@njit(parallel=True)
+#@njit(parallel=True)
+@njit
 def _linear_batch_value_function( feature_function, weights, states ):
 
     batch_size = len(states)
@@ -671,3 +707,39 @@ def _linear_batch_value_function( feature_function, weights, states ):
         values[i] = np.dot( weights, feature_function( states[i] ) )
 
     return values
+
+#@njit(parallel=True)
+@njit
+def _vectorized_is_terminal(state_vector):
+    """
+    state_vector: (N, 28) array
+    returns boolean array of length N
+    """
+    N = state_vector.shape[0]
+    done = np.zeros(N, dtype=np.bool_)
+
+    for i in prange(N):
+        s = state_vector[i]
+        # White borne off all 15 OR Black borne off all 15
+        done[i] = (s[26] == 15) or (s[27] == 15)
+
+    return done
+
+#@njit(parallel=True)
+@njit
+def _vectorized_reward(state_vector, player_vector):
+    """
+    Computes rewards for a batch of states from each player's perspective.
+    
+    state_vector: (N, 28) array of states
+    player_vector: (N,) array of +1 or -1 indicating whose perspective
+    
+    Returns: (N,) float32 rewards
+    """
+    N = len(state_vector)
+    out = np.empty(N, dtype=np.float32)
+
+    for i in prange(N):
+        out[i] = _reward(state_vector[i], player_vector[i])
+
+    return out
