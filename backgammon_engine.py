@@ -480,7 +480,7 @@ def _collect_search_data( state, player, dice ):
     # tree for batch evaluation by the (neural network) value function
 
     player_moves, player_afterstates = _actions( state, player, dice )
-    #print(f"[DEBUG] Root has {len(player_moves)} legal moves")
+    print(f"[DEBUG] Root has {len(player_moves)} legal moves")
     afterstates_dict = _unique_afterstates(player_moves, player_afterstates)
     states_buffer = List.empty_list(state)
     offsets = np.empty( (len(afterstates_dict), NUM_SORTED_ROLLS), np.int64)
