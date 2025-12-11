@@ -1,3 +1,5 @@
 flax
 optax
 jax
+numba
+numpy
