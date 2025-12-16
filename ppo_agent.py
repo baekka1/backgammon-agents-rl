@@ -55,54 +55,57 @@ def canonical_state(state: np.ndarray, player: int) -> np.ndarray:
     """
     return np.array(bge._to_canonical(state, np.int8(player)), dtype=np.int8)
 
-
 def encode_board_planes(state_canon: np.ndarray) -> np.ndarray:
     """
     state_canon: length-28 int8 array, canonical from 'white to move' POV.
-    Returns: board_planes of shape (24, 9) float32.
-    Channels:
-      0: empty          (1 if no checker on that point)
-      1: white blot     (exactly +1 checker)
-      2: black blot     (exactly -1 checker)
-      3: white made     (exactly +2)
-      4: black made     (exactly -2)
-      5: white builder  (exactly +3)
-      6: black builder  (exactly -3)
-      7: white deeper   (>= +4)
-      8: black deeper   (<= -4)
+
+    Returns: board_planes of shape (24, CONV_INPUT_CHANNELS) float32.
+
+    Channel layout (15 planes):
+
+      0                  : empty (count == 0)
+      1..6               : white count == 1..6  (one-hot)
+      7..12              : black count == 1..6  (one-hot)
+      13                 : white excess above 6, normalized by /4
+      14                 : black excess above 6, normalized by /4
     """
-    planes = np.zeros((NUM_POINTS, 9), dtype=np.float32)
+    planes = np.zeros((NUM_POINTS, CONV_INPUT_CHANNELS), dtype=np.float32)
+
+    EMPTY_CH   = 0
+    WHITE_BASE = 1          # channels 1..6
+    BLACK_BASE = 7          # channels 7..12
+    WHITE_EX   = 13
+    BLACK_EX   = 14
 
     for p in range(1, NUM_POINTS + 1):
         n = int(state_canon[p])
         idx = p - 1
 
         if n == 0:
-            planes[idx, 0] = 1.0
-        elif n > 0:
+            planes[idx, EMPTY_CH] = 1.0
+            continue
+
+        if n > 0:
             # white checkers
-            if n == 1:
-                planes[idx, 1] = 1.0
-            elif n == 2:
-                planes[idx, 3] = 1.0
-            elif n == 3:
-                planes[idx, 5] = 1.0
-            elif n >= 4:
-                planes[idx, 7] = 1.0
+            count = n
+            if count <= 6:
+                planes[idx, WHITE_BASE + (count - 1)] = 1.0
+            else:
+                # At least 6; mark the "6" plane and also encode excess
+                planes[idx, WHITE_BASE + 5] = 1.0
+                excess = min(count - 6, 4) / 4.0  # normalize, clamp at 4
+                planes[idx, WHITE_EX] = excess
         else:
             # black checkers
-            n_abs = -n
-            if n_abs == 1:
-                planes[idx, 2] = 1.0
-            elif n_abs == 2:
-                planes[idx, 4] = 1.0
-            elif n_abs == 3:
-                planes[idx, 6] = 1.0
-            elif n_abs >= 4:
-                planes[idx, 8] = 1.0
+            count = -n
+            if count <= 6:
+                planes[idx, BLACK_BASE + (count - 1)] = 1.0
+            else:
+                planes[idx, BLACK_BASE + 5] = 1.0
+                excess = min(count - 6, 4) / 4.0
+                planes[idx, BLACK_EX] = excess
 
     return planes
-
 
 def encode_aux_features(state_canon: np.ndarray) -> np.ndarray:
     """
@@ -140,7 +143,7 @@ def encode_state_for_net(state: np.ndarray, player: int) -> Tuple[np.ndarray, np
     """
     Given a physical engine state (28,), and current player (+1 or -1),
     produce:
-      board_flat: (216,) float32
+      board_flat: (BOARD_LENGTH * CONV_INPUT_CHANNELS,) float32
       aux:        (6,)   float32
     """
     state = np.asarray(state, dtype=np.int8)
@@ -174,7 +177,7 @@ def encode_batch_states_for_net(
 
 # ---------- PPO config and training state ----------
 
-@dataclass
+@dataclass(frozen=True)
 class PPOConfig:
     gamma: float = 0.99
     lam: float = 0.95
@@ -296,7 +299,7 @@ def compute_gae(
 
 
 class PPOMiniBatch(NamedTuple):
-    board_flat: jnp.ndarray  # (B, 216)
+    board_flat: jnp.ndarray  # (B, BOARD_LENGTH * CONV_INPUT_CHANNELS)
     aux: jnp.ndarray         # (B, 6)
     actions: jnp.ndarray     # (B,) int32, flat submove indices
     logp_old: jnp.ndarray    # (B,)
@@ -380,7 +383,7 @@ def ppo_update_step(
 class Transition(NamedTuple):
     state: np.ndarray        # (28,) int8
     player: int              # +1 or -1
-    board_flat: np.ndarray   # (216,) float32
+    board_flat: np.ndarray   # (B, BOARD_LENGTH * CONV_INPUT_CHANNELS)
     aux: np.ndarray          # (6,) float32
     action: int              # flat submove index [0,625)
     logp: float
@@ -862,5 +865,5 @@ def train_ppo_agent(
 if __name__ == "__main__":
     train_ppo_agent(
         num_episodes=1,          # start small
-        max_steps_per_episode=16 # keep this modest at first
+        max_steps_per_episode=2 # keep this modest at first
     )

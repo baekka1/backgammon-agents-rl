@@ -685,7 +685,7 @@ def play_batch_td0(weights: np.ndarray,
 if __name__ == "__main__":
     weights = init_weights()
     result = play_batch_td0(weights,
-                            batch_size=32,
+                            batch_size=5,
                             num_batches=100,
                             alpha=1e-3,
                             gamma=1.0)

@@ -4,9 +4,9 @@ import flax.linen as nn
 from typing import Tuple
 
 # --- Hyperparameters ---
-INPUT_CHANNELS_PER_PLAYER = 5
+INPUT_CHANNELS_PER_PLAYER = 7
 BOARD_LENGTH = 24
-CONV_INPUT_CHANNELS = 9
+CONV_INPUT_CHANNELS = 15
 AUX_INPUT_SIZE = 6 # 5 Aux + 1 Cube
 FILTERS = 128
 NUM_RESIDUAL_BLOCKS = 6
@@ -66,8 +66,9 @@ class BackgammonValueNet(nn.Module):
     def __call__(self, board_state: jnp.ndarray, aux_features: jnp.ndarray):
         """
         Args:
-            board_state: Array of shape (B, 216) [Flattened 24x9 board].
-            aux_features: Array of shape (B, 6) [Global game features].
+            board_state: Array of shape (B, BOARD_LENGTH * CONV_INPUT_CHANNELS)
+                [Flattened 24 x 15 board].
+            aux_features: Array of shape (B, AUX_INPUT_SIZE) [Global game features].
         """
         B = board_state.shape[0] # Batch size
         
@@ -124,11 +125,12 @@ class BackgammonActorCriticNet(nn.Module):
     """
     Shared ResNet backbone + value head + policy head.
     Inputs:
-      board_state: (B, 216) float32, flattened 24 x 9 planes
-      aux_features: (B, 6) float32
+        board_state: (B, BOARD_LENGTH * CONV_INPUT_CHANNELS) float32,
+            flattened 24 x 15 planes
+        aux_features: (B, AUX_INPUT_SIZE) float32
     Outputs:
-      value: (B,)  in [-3, 3]
-      policy_logits: (B, 25, 25) raw logits over (source, destination) submoves
+        value: (B,)  in [-3, 3]
+        policy_logits: (B, 25, 25) raw logits over (source, destination) submoves
     """
     @nn.compact
     def __call__(self, board_state: jnp.ndarray, aux_features: jnp.ndarray):
