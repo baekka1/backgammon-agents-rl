@@ -10,7 +10,7 @@ from feature_encoding import encode_board_batch, extract_aux_batch
 
 # Hyperparameters
 NUM_EPISODES = 1
-NUM_GAMES = 5
+NUM_GAMES = 1
 GAMMA = 0.99
 LAMBDA = 0.7
 ALPHA = 1e-4
