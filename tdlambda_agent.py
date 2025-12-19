@@ -21,8 +21,8 @@ from backgammon_value_net import BackgammonValueNet   # YOUR FLAX MODEL
 # 8-14: opponent        (count==1..6, overflow)
 
 # Hyperparameters
-NUM_EPISODES = 1
-NUM_GAMES = 4
+NUM_EPISODES = 5
+NUM_GAMES = 5
 GAMMA = 0.99
 LAMBDA = 0.7
 ALPHA = 1e-4
@@ -139,7 +139,14 @@ class BackgammonAgent:
         self.opt_state = optimizer.init(self.params)
 
         # Initialize eligibility traces
-        self.grads_trace = jax.tree.map(jnp.zeros_like, self.params)
+        self.grads_trace = None
+
+    def reset_traces(self, batch_size: int):
+        # trace pytree with leading batch dimension: (B, *param.shape)
+        self.grads_trace = jax.tree.map(
+            lambda p: jnp.zeros((batch_size,) + p.shape, dtype=p.dtype),
+            self.params
+        )
 
     # ----------------------------------------------------------
     #   Batch forward pass (JAX/JIT)
@@ -152,6 +159,62 @@ class BackgammonAgent:
     # ----------------------------------------------------------
     #   TD-lambda update (JAX/JIT)
     # ----------------------------------------------------------
+
+    @partial(jax.jit, static_argnums=0)
+    def td_lambda_update(self, params, opt_state, z,
+                         boards, aux, targets, active_mask,
+                         gamma, lam):
+        """
+        Semi-gradient TD(λ) with eligibility traces.
+
+        z: pytree with leading batch dim (B, ...)
+        active_mask: (B,) bool, True for games that are still running THIS step
+                     (use ~done from start of loop)
+        """
+
+        B = boards.shape[0]
+
+        # value function for a SINGLE sample (board: (24,15), aux: (6,))
+        def v_fn(p, b, a):
+            return self.model.apply(p, b[None, ...], a[None, ...]).squeeze()
+
+        # per-sample value + grad: v_t (B,), g_t pytree with leading B
+        (v_t, g_t) = jax.vmap(jax.value_and_grad(v_fn), in_axes=(None, 0, 0))(params, boards, aux)
+
+        # TD error per sample
+        delta = targets - v_t  # (B,)
+
+        # Mask out finished games (don’t change their traces/updates)
+        active = active_mask.astype(jnp.float32)  # (B,)
+
+        # z_t = γλ z_{t-1} + g_t   (only for active games)
+        z = jax.tree.map(
+            lambda z_leaf, g_leaf: (gamma * lam) * z_leaf + g_leaf,
+            z, g_t
+        )
+        z = jax.tree.map(
+            lambda z_leaf: z_leaf * active.reshape((B,) + (1,) * (z_leaf.ndim - 1)),
+            z
+        )
+
+        # Optax does gradient descent, but we want: w <- w + α * mean(delta * z)
+        # So pass grad = - mean(delta * z)
+        delta_bc = delta.astype(jnp.float32) * active  # zero out inactive
+        grads_for_opt = jax.tree.map(
+            lambda z_leaf: -jnp.mean(
+                z_leaf * delta_bc.reshape((B,) + (1,) * (z_leaf.ndim - 1)),
+                axis=0
+            ),
+            z
+        )
+
+        updates, opt_state = self.optimizer.update(grads_for_opt, opt_state, params=params)
+        params = optax.apply_updates(params, updates)
+
+        loss = 0.5 * jnp.mean((delta_bc) ** 2)  # just for logging
+
+        return params, opt_state, z, v_t, loss
+    '''
     @partial(jax.jit, static_argnums=0)
     def td_lambda_update(self, params, opt_state, grads_trace,
                          state_encoded, aux, target, gamma, lam):
@@ -176,10 +239,11 @@ class BackgammonAgent:
         params = optax.apply_updates(params, updates)
 
         return params, opt_state, grads_trace, pred, loss
-
+    '''
     # ----------------------------------------------------------
     #   Adapter function for Numba 2-ply search
     # ----------------------------------------------------------
+    '''
     def batch_value_function(self, final_states_buffer):
         # Nothing to evaluate
         if len(final_states_buffer) == 0:
@@ -194,7 +258,27 @@ class BackgammonAgent:
 
         values = self.batch_forward(self.params, boards, aux)
         return np.array(values, dtype=np.float32)
+    '''
+    def batch_value_function(self, final_states_buffer, chunk_size=2048):
+        if len(final_states_buffer) == 0:
+            return np.zeros(0, dtype=np.float32)
 
+        raw = np.stack(final_states_buffer).astype(np.int8)
+        L = raw.shape[0]
+
+        out = np.empty((L,), dtype=np.float32)
+
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            batch = jnp.asarray(raw[start:end])
+
+            boards = encode_board_batch(batch)
+            aux    = extract_aux_batch(batch)
+
+            vals = self.batch_forward(self.params, boards, aux)  # (chunk,)
+            out[start:end] = np.asarray(vals, dtype=np.float32)
+
+        return out
 
     # ----------------------------------------------------------
     #   Run 2-ply search and choose moves (Numba interface)
@@ -215,12 +299,22 @@ def train():
         # ---- Initialize batch of games ----
         state_vector, player_vector, dice_vector = bge._vectorized_new_game(NUM_GAMES)
         done = np.zeros(NUM_GAMES, dtype=bool)
+        agent.reset_traces(NUM_GAMES)
 
         total_loss = 0.0
         step = 0
 
         while not np.all(done):
             step += 1
+            if step % 50 == 0:
+                print(
+                    f"[ep {episode}] step={step} "
+                    f"done={done.sum()}/{NUM_GAMES} "
+                    f"avg_abs_pts={np.mean(np.abs(state_vector[:,1:25])):.2f} "
+                    f"mean_off_w={state_vector[:,26].mean():.2f} "
+                    f"mean_off_b={(-state_vector[:,27]).mean():.2f}"
+                )
+            active_mask = ~done 
 
             # 1. Select actions (batch)
             move_array = agent.select_action_batch(
@@ -264,6 +358,7 @@ def train():
             targets = reward_vector + GAMMA * bootstrap * (~done)
 
             # 8. TD-λ parameter update
+            '''
             agent.params, agent.opt_state, agent.grads_trace, preds, loss = \
                 agent.td_lambda_update(agent.params,
                                        agent.opt_state,
@@ -273,7 +368,18 @@ def train():
                                        targets,
                                        GAMMA,
                                        LAMBDA)
-
+            '''
+            agent.params, agent.opt_state, agent.grads_trace, preds, loss = agent.td_lambda_update(
+                agent.params,
+                agent.opt_state,
+                agent.grads_trace,
+                board_encoded,
+                aux_features,
+                jnp.asarray(targets, dtype=jnp.float32),
+                jnp.asarray(active_mask, dtype=jnp.bool_),
+                GAMMA,
+                LAMBDA
+            )
             total_loss += float(loss)
 
             # 9. Move to next state
@@ -282,7 +388,64 @@ def train():
             dice_vector = next_dice_vector
 
         print(f"Episode {episode}: steps={step}  mean_reward={reward_vector.mean():.2f}  loss={total_loss:.4f}")
+    return agent
 
+def is_terminal(state: np.ndarray) -> bool:
+    # black borne-off is negative in your engine
+    return (state[bge.W_OFF] == bge.NUM_CHECKERS) or (state[bge.B_OFF] == -bge.NUM_CHECKERS)
+
+def simulate_game(agent, max_turns=2000, verbose=True, seed=0):
+    np.random.seed(seed)
+
+    player, dice, state = bge._new_game()  # player in {+1,-1}, dice shape (2,), state shape (28,)
+
+    history = []  # (turn, player, dice, move, reward)
+    turn = 0
+
+    while (not is_terminal(state)) and (turn < max_turns):
+        turn += 1
+
+        # Use the already-rolled dice from _new_game on turn 1, otherwise roll new dice
+        if turn > 1:
+            dice = bge._roll_dice()
+
+        # Vectorized interface with batch size 1
+        state_vec  = np.expand_dims(state, axis=0).astype(np.int8)      # (1, 28)
+        player_vec = np.array([player], dtype=np.int8)                  # (1,)
+        dice_vec   = np.expand_dims(dice, axis=0).astype(np.int8)       # (1, 2)
+
+        move_list = agent.select_action_batch(state_vec, player_vec, dice_vec)
+        move = move_list[0]  # the Action for this single game
+
+        next_state = bge._apply_move(state, player, move)
+        r = bge._reward(next_state, player)
+
+        history.append((turn, int(player), tuple(map(int, dice)), move, float(r)))
+
+        if verbose:
+            print(f"turn={turn:4d} player={int(player):+d} dice={tuple(map(int,dice))} "
+                  f"move_len={len(move)} reward={r}")
+
+        state = next_state
+        if r != 0:
+            break
+
+        player = np.int8(-player)
+
+    if turn >= max_turns:
+        print(f"Hit max_turns={max_turns} without termination (likely a bug).")
+
+    # Final winner info
+    if state[bge.W_OFF] == bge.NUM_CHECKERS:
+        winner = +1
+    elif state[bge.B_OFF] == -bge.NUM_CHECKERS:
+        winner = -1
+    else:
+        winner = 0
+
+    return winner, state, history
 
 if __name__ == "__main__":
-    train()
+    agent = train()
+    winner, final_state, history = simulate_game(agent, verbose=True, seed=42)
+    print("winner:", winner)
