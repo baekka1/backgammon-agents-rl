@@ -199,22 +199,28 @@ def _reward(state, player):
             # backgammoned and loses three points
             if state[B_BAR] < 0:
                 return 3*player
-            for p in range(1,HOME_BOARD_SIZE+1):
+            for p in range(3*HOME_BOARD_SIZE+1,NUM_POINTS+1):
                 if state[p] < 0:
                     return 3*player
             return 2*player
-    if state[B_OFF] == NUM_CHECKERS:
+    if state[B_OFF] == -NUM_CHECKERS:
         # black has won
         if state[W_OFF] > 0:
             return -player
         else:
             if state[W_BAR] > 0:
                 return -3*player
-            for p in range(3*HOME_BOARD_SIZE+1,NUM_POINTS+1):
+            for p in range(1,HOME_BOARD_SIZE+1):
                 if state[p] > 0:
                     return -3*player
             return -2*player
     return 0
+
+@njit
+def _act(state, player, move):
+    new_state = _apply_move(state, player, move)
+    reward = _reward(new_state, player)
+    return reward, new_state
 
 @njit
 def _actions(state, current_player, dice):
@@ -236,8 +242,13 @@ def _actions(state, current_player, dice):
 
     if len(all_moves) == 0:
         # If no moves were possible at all (Forced Pass)
+        # no-op is only legal move
+        no_op = List.empty_list(TwoInt8Tuple)
+        all_moves.append( no_op )
+        all_afterstates.append( state )
+
         return all_moves, all_afterstates
-    
+
     # Player must use maximum number of dice possible
 
     max_dice_used = 0
@@ -445,17 +456,17 @@ def _vectorized_actions_parallel(state_vector, player_vector, dice_vector):
 
     return actions, afterstates
 
-@njit(parallel=True)
-def _vectorized_apply_move(state_vector, player_vector, dice_vector, move_sequence_vector):
 
-    new_state_vector = np.empty( len(state_vector), dtype=State )
-    
-    for i in prange( len(state_vector) ):
-        new_state_vector[i] = _apply_move( state_vector[i],
-                                           player_vector[i],
-                                           dice_vector[i],
-                                           move_sequence_vector[i] )
-    return new_state_vector
+@njit(parallel=True)
+def _vectorized_apply_move(states, players, move_sequences):
+
+    new_states = states.copy()
+
+    for i in prange( len(states) ):
+        new_states[i] = _apply_move( states[i],
+                                     players[i],
+                                     move_sequences[i] )
+    return new_states
 
 @njit
 def _collect_search_data( state, player, dice ):
@@ -524,6 +535,45 @@ def _select_optimal_move( values, offsets, afterstate_dict ):
 
     return afterstate_dict[ afterstates[ np.argmax( move_expected_values ) ] ]
 
+@njit
+def _unique_states_bool( state_buffer ):
+    state_dict = Dict.empty( StateTuple, np.bool_ )
+
+    for state in state_buffer:
+        state_dict[state] = True
+
+    return list(state_dict.keys())
+
+@njit
+def _state_value_dict( states, values ):
+    value_dict = Dict.empty( StateTuple, np.float32 )
+
+    for i in range(len(states)):
+        value_dict[ states[i] ] = np.float32( values[i] )
+
+    return value_dict
+
+@njit
+def _lookup_values( state_buffer, value_dict ):
+    l = len(state_buffer)
+    values = np.empty( l, dtype=np.float32 )
+    for i in range(l):
+        values[i] = value_dict[ state_buffer[i] ]
+    return values
+
+def _hashing_batch_value_function( batch_value_function, state_buffer ):
+    # this function removes duplicates from state_buffer,
+    # calls batch_value_function on the shorted buffer,
+    # and then returns values for the original buffer
+    # recreating duplicated values (this is to lighten load on gpu)
+    print( f"state buffer size: {len(state_buffer)}" )
+    states_to_eval = _unique_states_bool( state_buffer )
+    print( f"unique states to evaluate: {len(states_to_eval)}" )
+    values = batch_value_function( states_to_eval )
+    value_dict = _state_value_dict( states_to_eval, values )
+    value_buffer = _lookup_values( state_buffer, value_dict )
+    return value_buffer
+
 def _2_ply_search( state, player, dice, batch_value_function ):
     # this function calls into the numba code above from the python
     # interpreter, passes the array of states needing evaluation to a
@@ -534,84 +584,111 @@ def _2_ply_search( state, player, dice, batch_value_function ):
     # to convert, from say a JAX array, to an array numba can work
     # with
 
-    state_buffer, offsets, player_moves = _collect_search_data( state,
-                                                                player,
-                                                                dice )
+    (states_buffer, offsets,
+     afterstate_dict) = _collect_search_data( state, player, dice )
 
+    value_buffer = batch_value_function( states_buffer )
+
+    return _select_optimal_move( value_buffer, offsets,
+                                 afterstate_dict )
+
+def _2_ply_search_epsilon_greedy( state, player, dice, batch_value_function, epsilon ):
+    # this function calls into the numba code above from the python
+    # interpreter, passes the array of states needing evaluation to a
+    # provided batch_value_function (so that it can for example be
+    # batch evaluated on a gpu), and then passes the resulting values
+    # back to numba code. batch_value_function should return a numpy
+    # or numba array, in particular it is batch_value_function's job
+    # to convert, from say a JAX array, to an array numba can work
+    # with
+
+    if np.random.rand() < epsilon:
+        moves, _ = _actions( state, player, dice )
+        choice = np.random.randint( 0, len(moves) )
+        return moves[choice]
+
+    (state_buffer, offsets,
+     afterstate_dict) = _collect_search_data( state, player, dice )
+
+    # if np.random.rand() < epsilon:
+    #     keys = list( afterstate_dict )
+    #     choice = np.random.randint( 0, len(keys) )
+    #     return afterstate_dict[ keys[choice] ]
+    
     value_buffer = batch_value_function( state_buffer )
 
-    return _select_optimal_move( value_buffer, offsets, player_moves )
+    return _select_optimal_move( value_buffer, offsets,
+                                 afterstate_dict )
 
 @njit(parallel=True)
 def _vectorized_collect_search_data( state_vector, player_vector, dice_vector ):
     # vectorized version which takes arrays of states, players, and
     # dice, and returns a 1d buffer of states, an array of offset
-    # matrices, and an array of state counts which together which
-    # states belong to which combination of afterstates and dice.
+    # matrices, and an array of state counts which together encode
+    # which states belong to which combination of afterstates and
+    # dice.
     
     batch_size = len(state_vector)
 
-    (state_buffer,
-         offsets,
-         player_moves) = _collect_search_data( state_vector[0],
+    (state_buffer, offsets,
+     afterstate_dict) = _collect_search_data( state_vector[0],
                                                player_vector[0],
                                                dice_vector[0] )
 
-    final_states_buffer_array = List()
-    final_offsets = List()
-    final_player_moves = List()
+    state_buffer_list = List()
+    offsets_list = List()
+    afterstate_dicts = List()
 
-    # Preallocate the arrays so they can be written to in parallel
+    # Preallocate the lists so they can be written to in parallel
     for i in range(batch_size):
-        final_states_buffer_array.append(state_buffer)
-        final_offsets.append(offsets)
-        final_player_moves.append(player_moves)
+        state_buffer_list.append(state_buffer)
+        offsets_list.append(offsets)
+        afterstate_dicts.append(afterstate_dict)
 
     for i in prange(batch_size):
         (state_buffer,
          offsets,
-         player_moves) = _collect_search_data( state_vector[i],
-                                               player_vector[i],
-                                               dice_vector[i] )
+         afterstate_dict) = _collect_search_data( state_vector[i],
+                                                  player_vector[i],
+                                                  dice_vector[i] )
 
-        final_states_buffer_array[i] = state_buffer
-        final_offsets[i] = offsets
-        final_player_moves[i] = player_moves
+        state_buffer_list[i] = state_buffer
+        offsets_list[i] = offsets
+        afterstate_dicts[i] = afterstate_dict
 
     cumulative_state_counts = np.zeros( batch_size + 1, np.int64 )
     cumulative_state_count = 0
     for i in range(batch_size):
         cumulative_state_counts[i] = cumulative_state_count
-        cumulative_state_count += len(final_states_buffer_array[i])
+        cumulative_state_count += len(state_buffer_list[i])
     cumulative_state_counts[batch_size] = cumulative_state_count
 
-    final_states_buffer = List()
-    for state_buffer in final_states_buffer_array:
-        final_states_buffer.extend(state_buffer)
+    combined_state_buffer = List()
+    for state_buffer in state_buffer_list:
+        combined_state_buffer.extend(state_buffer)
 
-    return final_states_buffer, final_offsets, final_player_moves, cumulative_state_counts
+    return combined_state_buffer, offsets_list, afterstate_dicts, cumulative_state_counts
 
-
-@njit(parallel=True)
-def _vectorized_select_optimal_move( final_values, final_offsets, final_player_moves,
+@njit #(parallel=True)
+def _vectorized_select_optimal_move( value_buffer, offsets_list, player_moves,
                                      cumulative_state_counts ):
 
-    batch_size = len(final_offsets)
+    batch_size = len(offsets_list)
     block_start = 0
     block_end = 0
-    optimal_moves = np.empty( batch_size )
-    
-    for i in prange(batch_size):
+    optimal_moves = List()
+
+    for i in range(batch_size):
         optimal_move = _select_optimal_move(
-            final_values[ cumulative_state_counts[i]
+            value_buffer[ cumulative_state_counts[i]
                           : cumulative_state_counts[i+1]],
-            final_offsets[i],
-            final_player_moves[i] )
-        optimal_moves[i] = optimal_move
+            offsets_list[i],
+            player_moves[i] )
+        optimal_moves.append(optimal_move)
 
     return optimal_moves
 
-def _vectorized_2_ply_search( state_vector, player_vector, dice_vector, batch_value_function ):
+def _vectorized_2_ply_search( states, players, dices, batch_value_function ):
     # this function calls into the numba code above from the python
     # interpreter, passes the returned array of states to a provided
     # batch_value_function (so that it can for example be batch
@@ -620,16 +697,101 @@ def _vectorized_2_ply_search( state_vector, player_vector, dice_vector, batch_va
     # array, in particular it's batch_value_function's job to convert
     # from say a JAX array.
 
-    (fin_state_buffer, fin_offsets, fin_player_moves,
-     cum_state_counts) = _vectorized_collect_search_data( state_vector,
-                                                          player_vector,
-                                                          dice_vector )
+    (state_buffer, offsets_list, afterstate_dicts,
+     cumulative_state_counts) = _vectorized_collect_search_data(
+         states, players, dices )
 
-    fin_value_buffer = batch_value_function( fin_state_buffer )
+    value_buffer = batch_value_function( state_buffer )
 
-    return _vectorized_select_optimal_move( fin_value_buffer,
-                                            fin_offsets, fin_player_moves,
-                                            cum_state_counts)
+    return _vectorized_select_optimal_move( value_buffer,
+                                            offsets_list,
+                                            afterstate_dicts,
+                                            cumulative_state_counts)
+
+@njit
+def _filter_list_by_mask(l, mask):
+    l_true = List()
+    l_false = List()
+    true_indices = List.empty_list(types.int64)
+    false_indices = List.empty_list(types.int64)
+
+    for i in range(len(l)):
+        if mask[i]:
+            l_true.append(l[i])
+            true_indices.append(i)
+        else:
+            l_false.append(l[i])
+            false_indices.append(i)
+
+    return l_true, l_false, true_indices, false_indices
+
+@njit
+def _choose_explore_moves( states, players, dices ):
+    moves = List.empty_list(Action)
+    
+    for i in range(len(states)):
+        moves_i, _ = _actions( states[i], players[i], dices[i] )
+        choice = np.random.randint( 0, len(moves_i) )
+        moves.append( moves_i[choice] )
+
+    return moves
+
+@njit
+def _splice_moves( exploit_mask, explore_moves, exploit_moves ):
+    spliced_moves = List.empty_list(Action)
+    j=0
+    k=0
+    for i in range(len(exploit_mask)):
+        if exploit_mask[i]:
+            spliced_moves.append( exploit_moves[j] )
+            j += 1
+        else:
+            spliced_moves.append( explore_moves[k] )
+            k += 1
+
+    return spliced_moves
+
+def _vectorized_2_ply_search_epsilon_greedy( states, players, dices, batch_value_function, epsilon ):
+    # this function calls into the numba code above from the python
+    # interpreter, passes the array of states needing evaluation to a
+    # provided batch_value_function (so that it can for example be
+    # batch evaluated on a gpu), and then passes the resulting values
+    # back to numba code. batch_value_function should return a numpy
+    # or numba array, in particular it is batch_value_function's job
+    # to convert, from say a JAX array, to an array numba can work
+    # with
+
+    # randomly select which games will play greedily
+    exploit_mask = np.random.rand( len(states) ) >= epsilon
+
+    ( exploit_states, explore_states, _, _ ) = _filter_list_by_mask(
+        states, exploit_mask )
+
+    exploit_players = players[ exploit_mask ]
+    exploit_dices = dices[ exploit_mask ]
+
+    if len(exploit_states) > 0:
+        ( state_buffer, offsets_list, afterstate_dicts,
+          cumulative_state_counts ) = _vectorized_collect_search_data(
+              exploit_states, exploit_players, exploit_dices )
+
+        value_buffer = batch_value_function( state_buffer )
+
+    explore_players = players[ ~exploit_mask ]
+    explore_dices = dices[ ~exploit_mask ]
+    explore_moves = _choose_explore_moves( explore_states,
+                                           explore_players, explore_dices )
+
+    if len(exploit_states) > 0:
+        exploit_moves = _vectorized_select_optimal_move( value_buffer,
+                                                         offsets_list,
+                                                         afterstate_dicts,
+                                                         cumulative_state_counts )
+    else:
+        exploit_moves = List.empty_list(Action)
+
+    return _splice_moves( exploit_mask, explore_moves, exploit_moves )
+
 @njit(parallel=True)
 def _linear_batch_value_function( feature_function, weights, states ):
 
