@@ -119,3 +119,64 @@ class BackgammonValueNet(nn.Module):
         equity_estimate = jnp.tanh(v_raw)
 
         return equity_estimate
+
+class BackgammonActorCriticNet(nn.Module):
+    """
+    Shared ResNet backbone + value head + policy head.
+
+    Inputs:
+      board_state: (B, BOARD_LENGTH * CONV_INPUT_CHANNELS) float32, flattened 24 x 15 planes
+      aux_features: (B, AUX_INPUT_SIZE) float32
+
+    Outputs:
+      value: (B,) in [-3, 3]
+      policy_logits: (B, 25, 25) raw logits over (source, destination) submoves
+    """
+    filters: int = FILTERS
+    num_residual_blocks: int = NUM_RESIDUAL_BLOCKS
+    aux_size: int = AUX_INPUT_SIZE
+
+    @nn.compact
+    def __call__(self, board_state: jnp.ndarray, aux_features: jnp.ndarray):
+        B = board_state.shape[0]
+
+        # (B, 24*15) -> (B, 24, 15)
+        x = board_state.reshape(B, BOARD_LENGTH, CONV_INPUT_CHANNELS)
+
+        # Initial conv (kernel 7) + ReLU
+        x = nn.Conv(
+            features=self.filters,
+            kernel_size=(7,),
+            strides=(1,),
+            padding="SAME",
+            name="initial_conv_7",
+        )(x)
+        x = nn.relu(x)
+
+        # Residual stack
+        for i in range(self.num_residual_blocks):
+            x = ResidualBlockV2(
+                channels=self.filters,
+                kernel_size=3,
+                name=f"res_block_{i}",
+            )(x)
+
+        # Global avg pool over points axis -> (B, filters)
+        x = jnp.mean(x, axis=1)
+
+        # Concat aux -> (B, filters + aux_size)
+        x = jnp.concatenate([x, aux_features], axis=-1)
+
+        # ---- Value head ----
+        v = nn.Dense(features=64, name="value_dense_hidden")(x)
+        v = nn.relu(v)
+        v = nn.Dense(features=1, name="value_output")(v)
+        value = 3.0 * jnp.tanh(v).squeeze(-1)  # (B,)
+
+        # ---- Policy head ----
+        p = nn.Dense(features=64, name="policy_dense_hidden")(x)
+        p = nn.relu(p)
+        p = nn.Dense(features=25 * 25, name="policy_output")(p)
+        policy_logits = p.reshape(B, 25, 25)
+
+        return value, policy_logits

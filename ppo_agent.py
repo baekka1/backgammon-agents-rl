@@ -1,16 +1,21 @@
 # ppo_agent.py
-
+#
+# Usage (example):
+#   python ppo_agent.py --num_envs 128 --steps_per_rollout 256 --total_updates 2000
+#
 from __future__ import annotations
 
+import argparse
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
+
 import jax
 import jax.numpy as jnp
-import functools
-from flax.training.train_state import TrainState
 import optax
+from flax.training.train_state import TrainState
 
 import backgammon_engine as bge
 from backgammon_value_net import (
@@ -20,26 +25,9 @@ from backgammon_value_net import (
     AUX_INPUT_SIZE,
 )
 
-def eval_value_from_root(
-    state: np.ndarray,
-    root_player: int,
-    params: Any,
-    apply_fn,
-) -> float:
-    """
-    Evaluate leaf state with the value head from the root player's POV.
-    We canonicalize the state with respect to `root_player`, then run the net
-    and return the scalar value in [-3,3].
-    """
-    board_flat_np, aux_np = encode_state_for_net(state, root_player)
-    board_flat = jnp.asarray(board_flat_np[None, :])
-    aux = jnp.asarray(aux_np[None, :])
-    value, _ = apply_fn(params, board_flat, aux)
-    return float(value[0])
-
-
-# ---------- Feature encoding: 24 x 9 planes + 6 aux ----------
-
+# -------------------------
+# Constants / shapes
+# -------------------------
 NUM_POINTS = int(bge.NUM_POINTS)
 W_BAR = int(bge.W_BAR)
 B_BAR = int(bge.B_BAR)
@@ -47,823 +35,792 @@ W_OFF = int(bge.W_OFF)
 B_OFF = int(bge.B_OFF)
 NUM_CHECKERS = int(bge.NUM_CHECKERS)
 
+SUBMOVE_GRID = 25 * 25
+MAX_SUBMOVES = 4
 
-def canonical_state(state: np.ndarray, player: int) -> np.ndarray:
+# Policy-grid indexing (25 values each axis)
+# From-axis: 0=BAR, 1..24=points
+# To-axis:   0=OFF, 1..24=points
+
+
+def eng_from_to_grid_from(fp_eng: int) -> int:
+    # canonical player is +1, so bar is W_BAR in canonical state
+    return 0 if fp_eng == W_BAR else fp_eng  # points already 1..24
+
+
+def eng_to_to_grid_to(tp_eng: int) -> int:
+    # bearing off goes to W_OFF in canonical state
+    return 0 if tp_eng == W_OFF else tp_eng  # points already 1..24
+
+
+def grid_from_to_eng_from(fp_grid: int) -> int:
+    return W_BAR if fp_grid == 0 else fp_grid
+
+
+def grid_to_to_eng_to(tp_grid: int) -> int:
+    return W_OFF if tp_grid == 0 else tp_grid
+
+
+# ============================================================
+# Config
+# ============================================================
+
+@dataclass(frozen=True)
+class PPOConfig:
+    seed: int = 0
+
+    # Vectorized self-play
+    num_envs: int = 128
+    steps_per_rollout: int = 256
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+
+    # PPO
+    lr: float = 3e-4
+    clip_eps: float = 0.2
+    vf_coef: float = 1.0
+    ent_coef: float = 0.01
+    max_grad_norm: float = 1.0
+
+    ppo_epochs: int = 4
+    minibatch_size: int = 4096
+
+    # Logging
+    log_every: int = 10
+
+    # Policy pruning (used for competition search in the assignment)
+    top_k_prune: int = 5
+
+
+# ============================================================
+# Feature Encoding
+# ============================================================
+
+def to_canonical_state(state: np.ndarray, player: int) -> np.ndarray:
     """
-    Use the engine's canonical transform: from the current player's POV,
-    they are 'white' moving P1 -> P24.
+    Convert (state, player) -> canonical state where current player is +1 (white).
     """
-    return np.array(bge._to_canonical(state, np.int8(player)), dtype=np.int8)
+    return np.asarray(bge._to_canonical(state, np.int8(player)), dtype=np.int8)
+
 
 def encode_board_planes(state_canon: np.ndarray) -> np.ndarray:
     """
-    state_canon: length-28 int8 array, canonical from 'white to move' POV.
+    24 x 15 planes (float32), assignment semantic buckets.
 
-    Returns: board_planes of shape (24, CONV_INPUT_CHANNELS) float32.
+    Channel 0: Empty (shared) 1 if both players have count==0 at point i
 
-    Channel layout (15 planes):
+    For each player (canonical white = current player; canonical black = opponent):
+      Blot     (count==1)               -> binary
+      Made     (count==2)               -> binary
+      Builder  (count==3)               -> binary
+      Basic    (count==4)               -> binary
+      Deep     (count==5)               -> binary
+      Permanent(count==6)               -> binary
+      Overflow (count>6) normalized by 9 -> float in [0,1] ( (count-6)/9 )
 
-      0                  : empty (count == 0)
-      1..6               : white count == 1..6  (one-hot)
-      7..12              : black count == 1..6  (one-hot)
-      13                 : white excess above 6, normalized by /4
-      14                 : black excess above 6, normalized by /4
+    Layout:
+      0: Empty
+      1..7:  white buckets (blot, made, builder, basic, deep, permanent, overflow)
+      8..14: black buckets (same)
     """
     planes = np.zeros((NUM_POINTS, CONV_INPUT_CHANNELS), dtype=np.float32)
 
-    EMPTY_CH   = 0
-    WHITE_BASE = 1          # channels 1..6
-    BLACK_BASE = 7          # channels 7..12
-    WHITE_EX   = 13
-    BLACK_EX   = 14
+    EMPTY = 0
+    W0 = 1
+    B0 = 8
 
     for p in range(1, NUM_POINTS + 1):
-        n = int(state_canon[p])
-        idx = p - 1
+        v = int(state_canon[p])
+        w = max(v, 0)
+        b = max(-v, 0)
 
-        if n == 0:
-            planes[idx, EMPTY_CH] = 1.0
-            continue
+        planes[p - 1, EMPTY] = 1.0 if (w == 0 and b == 0) else 0.0
 
-        if n > 0:
-            # white checkers
-            count = n
-            if count <= 6:
-                planes[idx, WHITE_BASE + (count - 1)] = 1.0
-            else:
-                # At least 6; mark the "6" plane and also encode excess
-                planes[idx, WHITE_BASE + 5] = 1.0
-                excess = min(count - 6, 4) / 4.0  # normalize, clamp at 4
-                planes[idx, WHITE_EX] = excess
-        else:
-            # black checkers
-            count = -n
-            if count <= 6:
-                planes[idx, BLACK_BASE + (count - 1)] = 1.0
-            else:
-                planes[idx, BLACK_BASE + 5] = 1.0
-                excess = min(count - 6, 4) / 4.0
-                planes[idx, BLACK_EX] = excess
+        # white buckets
+        if w == 1:
+            planes[p - 1, W0 + 0] = 1.0
+        elif w == 2:
+            planes[p - 1, W0 + 1] = 1.0
+        elif w == 3:
+            planes[p - 1, W0 + 2] = 1.0
+        elif w == 4:
+            planes[p - 1, W0 + 3] = 1.0
+        elif w == 5:
+            planes[p - 1, W0 + 4] = 1.0
+        elif w == 6:
+            planes[p - 1, W0 + 5] = 1.0
+        elif w > 6:
+            planes[p - 1, W0 + 6] = min((w - 6) / 9.0, 1.0)
+
+        # black buckets
+        if b == 1:
+            planes[p - 1, B0 + 0] = 1.0
+        elif b == 2:
+            planes[p - 1, B0 + 1] = 1.0
+        elif b == 3:
+            planes[p - 1, B0 + 2] = 1.0
+        elif b == 4:
+            planes[p - 1, B0 + 3] = 1.0
+        elif b == 5:
+            planes[p - 1, B0 + 4] = 1.0
+        elif b == 6:
+            planes[p - 1, B0 + 5] = 1.0
+        elif b > 6:
+            planes[p - 1, B0 + 6] = min((b - 6) / 9.0, 1.0)
 
     return planes
 
+
 def encode_aux_features(state_canon: np.ndarray) -> np.ndarray:
     """
-    6 aux features:
-      For 'white' (current player):
-        - bar_active_white
-        - bar_scale_white  (bar / 15)
-        - borne_off_white  (W_OFF / 15)
-      For 'black' (opponent):
-        - bar_active_black
-        - bar_scale_black
-        - borne_off_black
-    Canonical white checkers are positive, black checkers are negative.
+    6 aux features (float32)
+
+    White (current player in canonical):
+      0: Bar active (1 if bar>0 else 0)
+      1: Bar scale (bar/15)
+      2: Borne-off scale (off/15)
+
+    Black (opponent in canonical):
+      3: Bar active
+      4: Bar scale
+      5: Borne-off scale
     """
     aux = np.zeros((AUX_INPUT_SIZE,), dtype=np.float32)
 
-    # White (current player)
-    white_bar = max(0, int(state_canon[W_BAR]))
-    white_off = max(0, int(state_canon[W_OFF]))
-    aux[0] = 1.0 if white_bar > 0 else 0.0
-    aux[1] = white_bar / float(NUM_CHECKERS)
-    aux[2] = white_off / float(NUM_CHECKERS)
+    w_bar = float(max(int(state_canon[W_BAR]), 0))
+    b_bar = float(max(int(-state_canon[B_BAR]), 0))
+    w_off = float(max(int(state_canon[W_OFF]), 0))
+    b_off = float(max(int(-state_canon[B_OFF]), 0))
 
-    # Black (opponent) – note negative signs in canonical rep
-    black_bar = max(0, -int(state_canon[B_BAR]))
-    black_off = max(0, -int(state_canon[B_OFF]))
-    aux[3] = 1.0 if black_bar > 0 else 0.0
-    aux[4] = black_bar / float(NUM_CHECKERS)
-    aux[5] = black_off / float(NUM_CHECKERS)
+    aux[0] = 1.0 if w_bar > 0 else 0.0
+    aux[1] = w_bar / float(NUM_CHECKERS)
+    aux[2] = w_off / float(NUM_CHECKERS)
+
+    aux[3] = 1.0 if b_bar > 0 else 0.0
+    aux[4] = b_bar / float(NUM_CHECKERS)
+    aux[5] = b_off / float(NUM_CHECKERS)
 
     return aux
 
 
-def encode_state_for_net(state: np.ndarray, player: int) -> Tuple[np.ndarray, np.ndarray]:
+def encode_batch_for_net(states_canon: np.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Given a physical engine state (28,), and current player (+1 or -1),
-    produce:
-      board_flat: (BOARD_LENGTH * CONV_INPUT_CHANNELS,) float32
-      aux:        (6,)   float32
-    """
-    state = np.asarray(state, dtype=np.int8)
-    state_canon = canonical_state(state, player)
-    planes = encode_board_planes(state_canon)
-    aux = encode_aux_features(state_canon)
-    return planes.reshape(-1).astype(np.float32), aux.astype(np.float32)
-
-
-def encode_batch_states_for_net(
-    states: np.ndarray, players: np.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    states:  (B, 28) int8
-    players: (B,)   int {+1,-1}
+    states_canon: (B, 28) int8, canonical where current player is +1
     Returns:
-      board_flat_batch: (B, 216)
-      aux_batch:        (B, 6)
+      board_flat: (B, 24*15) float32
+      aux: (B, 6) float32
     """
-    B = states.shape[0]
-    board_batch = np.zeros((B, BOARD_LENGTH * CONV_INPUT_CHANNELS), dtype=np.float32)
-    aux_batch = np.zeros((B, AUX_INPUT_SIZE), dtype=np.float32)
+    B = states_canon.shape[0]
+    boards = np.zeros((B, BOARD_LENGTH * CONV_INPUT_CHANNELS), dtype=np.float32)
+    auxs = np.zeros((B, AUX_INPUT_SIZE), dtype=np.float32)
 
     for i in range(B):
-        b_flat, a = encode_state_for_net(states[i], int(players[i]))
-        board_batch[i] = b_flat
-        aux_batch[i] = a
+        planes = encode_board_planes(states_canon[i])
+        aux = encode_aux_features(states_canon[i])
+        boards[i] = planes.reshape(-1)
+        auxs[i] = aux
 
-    return jnp.asarray(board_batch), jnp.asarray(aux_batch)
+    return jnp.asarray(boards), jnp.asarray(auxs)
 
 
-# ---------- PPO config and training state ----------
+# ============================================================
+# PPO data structures
+# ============================================================
 
-@dataclass(frozen=True)
-class PPOConfig:
-    gamma: float = 0.99
-    lam: float = 0.95
-    clip_eps: float = 0.2
-    value_coef: float = 0.5
-    entropy_coef: float = 0.01
-    lr: float = 3e-4
-    num_epochs: int = 4
-    minibatch_size: int = 256
+@dataclass
+class BatchRollout:
+    """
+    Stores what happened while playing many games at once.
+    """
+    states: np.ndarray        # (T, B, 28) int8  canonical at decision time
+    dices: np.ndarray         # (T, B, 2)  int8
 
+    submoves: np.ndarray      # (T, B, MAX_SUBMOVES, 2) int16 (chosen move, padded -1)
+    mask0: np.ndarray         # (T, B, 625) uint8 (legal first-submoves)
+    logp_old: np.ndarray      # (T, B) float32 (logp of FIRST submove under rollout policy)
+
+    values: np.ndarray        # (T, B) float32
+    rewards: np.ndarray       # (T, B) float32
+    dones: np.ndarray         # (T, B) uint8
+
+    def as_flat(self) -> Dict[str, np.ndarray]:
+        T, B = self.logp_old.shape
+        N = T * B
+        return {
+            "states": self.states.reshape(N, -1),
+            "dices": self.dices.reshape(N, -1),
+            "submoves": self.submoves.reshape(N, MAX_SUBMOVES, 2),
+            "mask0": self.mask0.reshape(N, SUBMOVE_GRID),
+            "logp_old": self.logp_old.reshape(N),
+            "values": self.values.reshape(N),
+            "rewards": self.rewards.reshape(N),
+            "dones": self.dones.reshape(N),
+        }
+
+
+# ============================================================
+# JAX model / train state
+# ============================================================
 
 class PPOTrainState(TrainState):
-    # params: actor-critic params (value + policy)
     pass
 
 
-def create_ppo_train_state(
-    rng: jax.random.PRNGKey,
-    config: PPOConfig,
-) -> PPOTrainState:
-    """
-    Initialize actor-critic net and optimizer.
-    """
+def make_train_state(rng_key: jax.Array, lr: float, max_grad_norm: float) -> PPOTrainState:
     model = BackgammonActorCriticNet()
-    # Dummy input to initialize shapes
     dummy_board = jnp.zeros((1, BOARD_LENGTH * CONV_INPUT_CHANNELS), dtype=jnp.float32)
     dummy_aux = jnp.zeros((1, AUX_INPUT_SIZE), dtype=jnp.float32)
-    params = model.init(rng, dummy_board, dummy_aux)
+    params = model.init(rng_key, dummy_board, dummy_aux)
 
-    tx = optax.adam(config.lr)
-
+    tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.adam(lr),
+    )
     return PPOTrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-# ---------- Action encoding on 25x25 grid ----------
-
-def submove_to_indices(from_point: int, to_point: int, player: int) -> tuple[int, int]:
+@jax.jit
+def model_forward(params: Any, board_flat: jnp.ndarray, aux: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Map engine (from_point, to_point, player) to (i_src, i_dst) in [0,24].
-    Conventions (per current player):
-      src:
-        0      -> bar (their bar index)
-        1..24  -> physical points 1..24
-      dst:
-        0..23  -> physical points 1..24
-        24     -> their bear-off
-    Engine indices:
-      W_BAR=0, B_BAR=25, W_OFF=26, B_OFF=27
+    Returns:
+      values: (B,)
+      logits: (B, 25, 25)
     """
-    # Current player's bar/off indices
-    bar_idx = W_BAR if player == 1 else B_BAR
-    off_idx = W_OFF if player == 1 else B_OFF
+    v, logits = BackgammonActorCriticNet().apply(params, board_flat, aux)
+    return v, logits
 
-    # --- source index ---
-    if from_point == bar_idx:
-        i_src = 0
-    else:
-        # from_point is 1..24
-        i_src = from_point  # 1..24
 
-    # --- destination index ---
-    if to_point == off_idx:
-        i_dst = 24
-    else:
-        # 1..24 -> 0..23
-        i_dst = to_point - 1
+# ============================================================
+# Masked softmax utilities (numpy-side sampling)
+# ============================================================
 
-    return i_src, i_dst
-
-def indices_to_flat(i_src: int, i_dst: int) -> int:
+def masked_log_softmax(logits: np.ndarray, mask01: np.ndarray) -> np.ndarray:
     """
-    Flatten (i_src, i_dst) into single integer in [0, 625).
+    logits: (625,) float32
+    mask01: (625,) uint8 {0,1}
+    returns logprobs for all positions (masked entries get large negative)
     """
-    return i_src * 25 + i_dst
+    if mask01.sum() == 0:
+        l = logits - logits.max()
+        logz = np.log(np.exp(l).sum() + 1e-9)
+        return l - logz
+
+    neg_inf = -1e30
+    masked = np.where(mask01.astype(bool), logits, neg_inf)
+    m = masked.max()
+    ex = np.exp(masked - m) * mask01
+    z = ex.sum() + 1e-9
+    return (masked - m) - np.log(z)
 
 
-def flat_to_indices(a: int) -> Tuple[int, int]:
-    """
-    Inverse of indices_to_flat.
-    """
-    return a // 25, a % 25
+def sample_from_logprobs(rng: np.random.Generator, logp: np.ndarray, mask01: np.ndarray) -> int:
+    p = np.exp(logp) * mask01
+    s = p.sum()
+    if s <= 0:
+        legal = np.flatnonzero(mask01)
+        return int(legal[np.argmax(logp[legal])])
+    p = p / s
+    return int(rng.choice(np.arange(p.shape[0]), p=p))
 
-# ---------- GAE and PPO loss ----------
+
+# ============================================================
+# Move helpers (convert engine Action -> (from,to) submoves)
+# ============================================================
+
+def action_to_submoves(action: Any, player: int) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    for (from_point, roll) in action:
+        fp_eng = int(from_point)
+        r = int(roll)
+        tp_eng = int(bge._get_target_index(np.int8(fp_eng), np.int8(r), np.int8(player)))
+
+        fp_grid = eng_from_to_grid_from(fp_eng)
+        tp_grid = eng_to_to_grid_to(tp_eng)
+
+        out.append((fp_grid, tp_grid))
+    return out
+
+
+def build_stage0_mask_from_candidate_moves(candidate_moves_sub: List[List[Tuple[int, int]]]) -> np.ndarray:
+    """
+    Build a (625,) uint8 mask for legal FIRST submoves.
+    """
+    mask = np.zeros((25, 25), dtype=np.uint8)
+    for mv in candidate_moves_sub:
+        if len(mv) >= 1:
+            f, t = mv[0]
+            if 0 <= f < 25 and 0 <= t < 25:
+                mask[f, t] = 1
+    return mask.reshape(-1)
+
+
+def filter_candidates_by_choice(
+    candidate_moves_sub: List[List[Tuple[int, int]]],
+    stage: int,
+    chosen_flat_idx: int,
+) -> List[List[Tuple[int, int]]]:
+    f = chosen_flat_idx // 25
+    t = chosen_flat_idx % 25
+    kept = []
+    for mv in candidate_moves_sub:
+        if stage < len(mv) and mv[stage][0] == f and mv[stage][1] == t:
+            kept.append(mv)
+    return kept
+
+
+def apply_one_submove(state: np.ndarray, player: int, from_pt: int, to_pt: int) -> np.ndarray:
+    # grid -> engine
+    fp_eng = grid_from_to_eng_from(int(from_pt))
+    tp_eng = grid_to_to_eng_to(int(to_pt))
+
+    ns = bge._apply_sub_move(state, np.int8(player), np.int8(fp_eng), np.int8(tp_eng))
+    if ns is None:
+        raise RuntimeError(
+            f"_apply_sub_move returned None for from={from_pt} to={to_pt} "
+            f"(engine from={fp_eng} to={tp_eng})"
+        )
+    return np.asarray(ns, dtype=np.int8)
+
+
+# ============================================================
+# Vectorized reward for canonical POV
+# ============================================================
+
+def reward_canonical(states_after: np.ndarray) -> np.ndarray:
+    B = states_after.shape[0]
+    r = np.zeros((B,), dtype=np.float32)
+    p = np.int8(1)
+    for i in range(B):
+        # bge._reward returns win/loss (including gammon/backgammon magnitudes)
+        r[i] = float(bge._reward(states_after[i], p))
+    return r
+
+
+# ============================================================
+# Vectorized rollout with sequential submove sampling
+# ============================================================
+
+def rollout_vectorized(
+    rng: np.random.Generator,
+    train_state: PPOTrainState,
+    cfg: PPOConfig,
+    states: np.ndarray,
+    dices: np.ndarray,
+) -> Tuple[BatchRollout, np.ndarray, np.ndarray]:
+    B = cfg.num_envs
+    T = cfg.steps_per_rollout
+
+    buf_states = np.zeros((T, B, 28), dtype=np.int8)
+    buf_dices = np.zeros((T, B, 2), dtype=np.int8)
+    buf_submoves = np.full((T, B, MAX_SUBMOVES, 2), -1, dtype=np.int16)
+
+    buf_mask0 = np.zeros((T, B, SUBMOVE_GRID), dtype=np.uint8)
+    buf_logp0 = np.zeros((T, B), dtype=np.float32)
+
+    buf_vals = np.zeros((T, B), dtype=np.float32)
+    buf_rew = np.zeros((T, B), dtype=np.float32)
+    buf_done = np.zeros((T, B), dtype=np.uint8)
+
+    cur_states = states.copy()
+    cur_dices = dices.copy()
+
+    for t in range(T):
+        buf_states[t] = cur_states
+        buf_dices[t] = cur_dices
+
+        # Forward pass
+        board_flat, aux = encode_batch_for_net(cur_states)
+        v_jax, logits_jax = model_forward(train_state.params, board_flat, aux)
+        v = np.asarray(v_jax, dtype=np.float32)
+        logits = np.asarray(logits_jax, dtype=np.float32).reshape(B, SUBMOVE_GRID)
+        buf_vals[t] = v
+
+        # Parse through legal moves
+        players = np.ones((B,), dtype=np.int8)  # canonical player always +1
+        legal_moves, _legal_afterstates = bge._vectorized_actions_parallel(cur_states, players, cur_dices)
+
+        chosen_actions: List[Any] = [None] * B
+
+        # Build per-env candidate lists
+        candidates_sub: List[List[List[Tuple[int, int]]]] = []
+        candidates_raw: List[List[Any]] = []
+        for i in range(B):
+            mv_list = list(legal_moves[i])
+            candidates_raw.append(mv_list)
+            mv_sub = [action_to_submoves(mv, player=1) for mv in mv_list]
+            candidates_sub.append(mv_sub)
+
+        # Build mask0, sample first submove, store logp_old
+        stage0_masks = np.zeros((B, SUBMOVE_GRID), dtype=np.uint8)
+        chosen0_flat = np.full((B,), -1, dtype=np.int32)
+        logp0 = np.zeros((B,), dtype=np.float32)
+
+        for i in range(B):
+            if len(candidates_sub[i]) == 0:
+                continue
+            m0 = build_stage0_mask_from_candidate_moves(candidates_sub[i])
+            stage0_masks[i] = m0
+            if m0.sum() == 0:
+                continue
+
+            log_soft = masked_log_softmax(logits[i], m0)
+            a0 = sample_from_logprobs(rng, log_soft, m0)
+            chosen0_flat[i] = a0
+            logp0[i] = float(log_soft[a0])
+
+            f0 = a0 // 25
+            t0p = a0 % 25
+            buf_submoves[t, i, 0, 0] = f0
+            buf_submoves[t, i, 0, 1] = t0p
+
+            candidates_sub[i] = filter_candidates_by_choice(candidates_sub[i], stage=0, chosen_flat_idx=int(a0))
+
+        buf_mask0[t] = stage0_masks
+        buf_logp0[t] = logp0
+
+        inter_states = cur_states.copy()
+        for i in range(B):
+            if chosen0_flat[i] >= 0:
+                f0 = int(chosen0_flat[i] // 25)
+                t0p = int(chosen0_flat[i] % 25)
+                inter_states[i] = apply_one_submove(inter_states[i], player=1, from_pt=f0, to_pt=t0p)
+
+        # Keep sampling submoves to get a legal full move for environment transition
+        unresolved = np.array([len(candidates_sub[i]) > 1 for i in range(B)], dtype=bool)
+
+        for stage in range(1, MAX_SUBMOVES):
+            idxs = np.where(unresolved)[0]
+            if len(idxs) == 0:
+                break
+
+            bf, ax = encode_batch_for_net(inter_states[idxs])
+            _v2, lg2 = model_forward(train_state.params, bf, ax)
+            stage_logits = np.asarray(lg2, dtype=np.float32).reshape(len(idxs), SUBMOVE_GRID)
+
+            for j, i in enumerate(idxs):
+                if len(candidates_sub[i]) == 0:
+                    unresolved[i] = False
+                    continue
+
+                # stage legality mask
+                mask = np.zeros((25, 25), dtype=np.uint8)
+                for mv in candidates_sub[i]:
+                    if stage < len(mv):
+                        f, tt = mv[stage]
+                        if 0 <= f < 25 and 0 <= tt < 25:
+                            mask[f, tt] = 1
+                mask = mask.reshape(-1)
+
+                if mask.sum() == 0:
+                    unresolved[i] = False
+                    continue
+
+                log_soft = masked_log_softmax(stage_logits[j], mask)
+                a = sample_from_logprobs(rng, log_soft, mask)
+
+                f = a // 25
+                to = a % 25
+                buf_submoves[t, i, stage, 0] = f
+                buf_submoves[t, i, stage, 1] = to
+
+                candidates_sub[i] = filter_candidates_by_choice(candidates_sub[i], stage, int(a))
+
+                # update intermediate state
+                inter_states[i] = apply_one_submove(inter_states[i], player=1, from_pt=int(f), to_pt=int(to))
+
+                unresolved[i] = (len(candidates_sub[i]) > 1)
+
+        # Finalize chosen action per env
+        for i in range(B):
+            if len(candidates_raw[i]) == 0:
+                chosen_actions[i] = bge.List.empty_list(bge.TwoInt8Tuple)
+                continue
+
+            # If we filtered down to exactly one candidate, pick it.
+            if len(candidates_sub[i]) == 1:
+                target = candidates_sub[i][0]
+                found = None
+                for mv in candidates_raw[i]:
+                    if action_to_submoves(mv, player=1) == target:
+                        found = mv
+                        break
+                chosen_actions[i] = found if found is not None else candidates_raw[i][0]
+            else:
+                # still ambiguous -> choose first deterministically
+                chosen_actions[i] = candidates_raw[i][0]
+
+        # Apply moves in batch
+        move_seq = bge.List()  # numba typed list
+        for i in range(B):
+            move_seq.append(chosen_actions[i])
+        next_states = bge._vectorized_apply_move(cur_states, players, move_seq)
+
+        # Reward + done
+        next_states_np = np.asarray(next_states, dtype=np.int8)
+        r = reward_canonical(next_states_np)
+        done = (r != 0.0).astype(np.uint8)
+
+        buf_rew[t] = r
+        buf_done[t] = done
+
+        # Advance envs: reset terminals; otherwise canonicalize to opponent-to-move
+        rolled = bge._vectorized_roll_dice(B)
+        next_dices = np.asarray(rolled, dtype=np.int8)
+
+        for i in range(B):
+            if done[i]:
+                p, d, s = bge._new_game()
+                s = np.asarray(s, dtype=np.int8)
+                cur_states[i] = to_canonical_state(s, int(p))
+                cur_dices[i] = np.asarray(d, dtype=np.int8)
+            else:
+                cur_states[i] = to_canonical_state(next_states_np[i], player=-1)
+                cur_dices[i] = next_dices[i]
+
+    rollout = BatchRollout(
+        states=buf_states,
+        dices=buf_dices,
+        submoves=buf_submoves,
+        mask0=buf_mask0,
+        logp_old=buf_logp0,
+        values=buf_vals,
+        rewards=buf_rew,
+        dones=buf_done,
+    )
+    return rollout, cur_states, cur_dices
+
+
+# ============================================================
+# GAE
+# ============================================================
 
 def compute_gae(
-    rewards: np.ndarray,
-    values: np.ndarray,
-    dones: np.ndarray,
+    rollout: BatchRollout,
+    last_values: np.ndarray,
     gamma: float,
     lam: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Standard GAE-Lambda for a single trajectory.
-    rewards, values, dones: shape (T,)
-    Returns:
-      advantages: (T,)
-      returns:    (T,)
-    """
-    T = len(rewards)
-    adv = np.zeros(T, dtype=np.float32)
-    last_gae = 0.0
+    T, B = rollout.values.shape
+    adv = np.zeros((T, B), dtype=np.float32)
+    last_gae = np.zeros((B,), dtype=np.float32)
 
     for t in reversed(range(T)):
-        if t == T - 1:
-            next_nonterminal = 1.0 - float(dones[t])
-            next_value = 0.0
-        else:
-            next_nonterminal = 1.0 - float(dones[t + 1])
-            next_value = values[t + 1]
+        done = rollout.dones[t].astype(np.float32)
+        not_done = 1.0 - done
 
-        delta = (
-            rewards[t] + gamma * next_value * next_nonterminal - values[t]
-        )
-        last_gae = delta + gamma * lam * next_nonterminal * last_gae
+        v = rollout.values[t]
+        v_next = last_values if t == T - 1 else rollout.values[t + 1]
+
+        delta = rollout.rewards[t] + gamma * v_next * not_done - v
+        last_gae = delta + gamma * lam * not_done * last_gae
         adv[t] = last_gae
 
-    returns = values + adv
-    return adv, returns
+    ret = adv + rollout.values
+    return adv, ret
 
 
-class PPOMiniBatch(NamedTuple):
-    board_flat: jnp.ndarray  # (B, BOARD_LENGTH * CONV_INPUT_CHANNELS)
-    aux: jnp.ndarray         # (B, 6)
-    actions: jnp.ndarray     # (B,) int32, flat submove indices
-    logp_old: jnp.ndarray    # (B,)
-    advantages: jnp.ndarray  # (B,)
-    returns: jnp.ndarray     # (B,)
+# ============================================================
+# PPO update (ratio uses only first submove)
+# ============================================================
 
-
-def ppo_loss_fn(
-    params: Any,
-    apply_fn,
-    batch: PPOMiniBatch,
-    config: PPOConfig,
-) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """
-    Clipped PPO objective + value loss + entropy bonus.
-    """
-    values, policy_logits = apply_fn(
-        params, batch.board_flat, batch.aux
-    )  # values: (B,), logits: (B,25,25)
-
-    # --- policy loss ---
-    logits_flat = policy_logits.reshape(policy_logits.shape[0], -1)  # (B,625)
-    log_probs_all = jax.nn.log_softmax(logits_flat, axis=-1)         # (B,625)
-
-    idx = batch.actions  # (B,)
-    logp = jnp.take_along_axis(
-        log_probs_all, idx[:, None], axis=1
-    ).squeeze(-1)
-
-    ratio = jnp.exp(logp - batch.logp_old)  # (B,)
-    adv = batch.advantages
-    # normalize advantages
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-    unclipped = ratio * adv
-    clipped = jnp.clip(
-        ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps
-    ) * adv
-    policy_loss = -jnp.mean(jnp.minimum(unclipped, clipped))
-
-    # --- value loss ---
-    value_loss = jnp.mean((batch.returns - values) ** 2)
-
-    # --- entropy bonus ---
-    entropy = -jnp.mean(
-        jnp.sum(jnp.exp(log_probs_all) * log_probs_all, axis=-1)
-    )
-
-    loss = (
-        policy_loss
-        + config.value_coef * value_loss
-        - config.entropy_coef * entropy
-    )
-
-    metrics = {
-        "loss": loss,
-        "policy_loss": policy_loss,
-        "value_loss": value_loss,
-        "entropy": entropy,
-    }
-    return loss, metrics
-
-
-@functools.partial(jax.jit, static_argnames=("config",))
-def ppo_update_step(
-    state: PPOTrainState,
-    batch: PPOMiniBatch,
-    config: PPOConfig,
-) -> Tuple[PPOTrainState, Dict[str, jnp.ndarray]]:
-    grad_fn = jax.value_and_grad(ppo_loss_fn, has_aux=True)
-    (loss, metrics), grads = grad_fn(
-        state.params, state.apply_fn, batch, config
-    )
-    new_state = state.apply_gradients(grads=grads)
-    metrics = {k: jax.lax.stop_gradient(v) for k, v in metrics.items()}
-    return new_state, metrics
-
-
-# ---------- Replay buffer structure (simple list-based) ----------
-
-class Transition(NamedTuple):
-    state: np.ndarray        # (28,) int8
-    player: int              # +1 or -1
-    board_flat: np.ndarray   # (B, BOARD_LENGTH * CONV_INPUT_CHANNELS)
-    aux: np.ndarray          # (6,) float32
-    action: int              # flat submove index [0,625)
-    logp: float
-    value: float
-    reward: float            # from canonical 'white' POV
-    done: bool
-
-
-class ReplayBuffer:
-    def __init__(self):
-        self.data: List[Transition] = []
-
-    def add(self, tr: Transition):
-        self.data.append(tr)
-
-    def clear(self):
-        self.data.clear()
-
-    def as_arrays(self) -> Dict[str, np.ndarray]:
-        """
-        Stack into numpy arrays for a single trajectory / batch.
-        """
-        states = np.stack([t.state for t in self.data], axis=0)
-        players = np.asarray([t.player for t in self.data], dtype=np.int32)
-        board_flat = np.stack([t.board_flat for t in self.data], axis=0)
-        aux = np.stack([t.aux for t in self.data], axis=0)
-        actions = np.asarray([t.action for t in self.data], dtype=np.int32)
-        logp = np.asarray([t.logp for t in self.data], dtype=np.float32)
-        values = np.asarray([t.value for t in self.data], dtype=np.float32)
-        rewards = np.asarray([t.reward for t in self.data], dtype=np.float32)
-        dones = np.asarray([t.done for t in self.data], dtype=bool)
-
-        return dict(
-            states=states,
-            players=players,
-            board_flat=board_flat,
-            aux=aux,
-            actions=actions,
-            logp=logp,
-            values=values,
-            rewards=rewards,
-            dones=dones,
-        )
-
-
-# ---------- Using engine + policy: picking/pruning moves ----------
-
-def top_k_moves_by_policy(
-    state: np.ndarray,
-    player: int,
-    dice: np.ndarray,
-    params: Any,
-    apply_fn,
-    k: int = 5,
-) -> Tuple[List[bge.Action], List[np.ndarray]]:
-    """
-    Return up to K legal moves, ranked by the policy's logits on their first submove.
-    state   : engine state (28,)
-    player  : +1 or -1 (side to move)
-    dice    : np.ndarray shape (2,) int8, sorted as in engine
-    params  : actor-critic params
-    apply_fn: Flax apply function
-    Returns:
-      candidate_moves      : list of engine moves (each a list[(from_point, roll)])
-      candidate_afterstates: list of resulting states (np.ndarray int8) after applying each move
-                             (same length as candidate_moves)
-    """
-    moves, afterstates = bge._actions(state, player, dice)
-    if len(moves) == 0:
-        return [], []
-
-    # Featurize from this player's POV
-    board_flat_np, aux_np = encode_state_for_net(state, player)
-    board_flat = jnp.asarray(board_flat_np[None, :])
-    aux = jnp.asarray(aux_np[None, :])
-
-    _, policy_logits = apply_fn(params, board_flat, aux)  # (1,25,25)
-    logits_flat = np.array(policy_logits.reshape(-1), dtype=np.float64)  # (625,)
-
-    scores: List[float] = []
-    for mv in moves:
-        from_point, roll = mv[0]
-        to_point = int(bge._get_target_index(from_point, roll, player))
-        i_src, i_dst = submove_to_indices(from_point, to_point, player)
-        flat_idx = indices_to_flat(i_src, i_dst)
-        scores.append(float(logits_flat[flat_idx]))
-
-    # Sort moves by score descending
-    idx_sorted = np.argsort(-np.asarray(scores))
-    k_eff = min(k, len(moves))
-    chosen_moves: List[bge.Action] = []
-    chosen_after: List[np.ndarray] = []
-    for i in idx_sorted[:k_eff]:
-        chosen_moves.append(moves[i])
-        chosen_after.append(np.array(afterstates[i], dtype=np.int8))
-
-    return chosen_moves, chosen_after
-
-def pick_action_from_policy(
-    rng: np.random.Generator,
-    state: np.ndarray,
-    player: int,
-    dice: np.ndarray,
-    params: Any,
-    apply_fn,
-) -> tuple[bge.Action, int, float, float]:
-    """
-    Sample a legal move according to the policy over submoves.
-    Returns:
-      chosen_move       : engine move (list of (from_point, roll))
-      action_flat_index : int in [0, 625) for PPO
-      logp              : log π(a|s) for that submove (used in PPO)
-      value             : V(s) from the network (canonical current-player POV)
-    """
-    moves, afterstates = bge._actions(state, player, dice)
-    if len(moves) == 0:
-        # forced pass, no action; treat as no-op
-        # value still useful, but no policy term
-        board_flat_np, aux_np = encode_state_for_net(state, player)
-        board_flat = jnp.asarray(board_flat_np[None, :])
-        aux = jnp.asarray(aux_np[None, :])
-        value, _ = apply_fn(params, board_flat, aux)
-        value = float(value[0])
-        return moves, 0, 0.0, value
-
-    # ---- featurize state for net ----
-    board_flat_np, aux_np = encode_state_for_net(state, player)
-    board_flat = jnp.asarray(board_flat_np[None, :])  # (1,216)
-    aux = jnp.asarray(aux_np[None, :])                # (1,6)
-
-    value, policy_logits = apply_fn(params, board_flat, aux)
-    value = float(value[0])                            # scalar
-    logits_flat = policy_logits.reshape(1, -1)[0]      # (625,) as jnp
-    logits_np = np.array(logits_flat, dtype=np.float64)
-
-    # ---- build mask over the 25x25 grid ----
-    # legal_mask[i_src, i_dst] = True if that submove is allowed for at least one move
-    legal_mask = np.zeros((25, 25), dtype=bool)
-
-    move_first_submove_idx: list[int] = []
-
-    for mv in moves:
-        from_point, roll = mv[0]
-        to_point = int(bge._get_target_index(from_point, roll, player))
-        i_src, i_dst = submove_to_indices(from_point, to_point, player)
-        legal_mask[i_src, i_dst] = True
-        flat_idx = indices_to_flat(i_src, i_dst)
-        move_first_submove_idx.append(flat_idx)
-
-    legal_flat_indices = np.where(legal_mask.reshape(-1))[0]
-    if legal_flat_indices.size == 0:
-        # should not really happen if moves non-empty
-        legal_flat_indices = np.unique(np.array(move_first_submove_idx))
-
-    masked_logits = np.full_like(logits_np, -1e9)
-    masked_logits[legal_flat_indices] = logits_np[legal_flat_indices]
-
-    # softmax
-    shifted = masked_logits - masked_logits.max()
-    probs = np.exp(shifted)
-    probs_sum = probs.sum()
-    if probs_sum <= 0.0:
-        # numeric safety: fall back to uniform over legal
-        probs = np.zeros_like(masked_logits)
-        probs[legal_flat_indices] = 1.0
-        probs_sum = probs.sum()
-    probs /= probs_sum
-
-    # sample a submove index
-    a = int(rng.choice(len(probs), p=probs))
-    logp = float(np.log(probs[a] + 1e-8))
-
-    # among moves whose first submove maps to this submove index, pick one
-    candidates = [
-        mv for mv, idx in zip(moves, move_first_submove_idx) if idx == a
-    ]
-    if not candidates:
-        chosen_move = moves[0]
-    else:
-        chosen_move = candidates[rng.integers(len(candidates))]
-
-    return chosen_move, a, logp, value
-
-def two_ply_value_pruned(
-    state: np.ndarray,
-    root_player: int,
-    dice_root: np.ndarray,
-    params: Any,
-    apply_fn,
-    k_root: int = 5,
-) -> float:
-    """
-    Approximate V(S) with a 2-ply search:
-      - At the root (player = root_player, dice_root), use the policy to pick
-        the top-k_root moves.
-      - For each candidate root move, consider all 21 sorted opponent dice.
-      - For each opponent roll, enumerate ALL legal opponent moves, and take
-        the worst (minimum) value from the root player's POV.
-      - Return the maximum expected value over root's candidate moves.
-    This mirrors Agent 1/2's logic but with policy-guided pruning at the root.
-    """
-    # Root's candidate moves (pruned)
-    candidate_moves, candidate_afterstates = top_k_moves_by_policy(
-        state, root_player, dice_root, params, apply_fn, k=k_root
-    )
-
-    if len(candidate_moves) == 0:
-        # Forced pass or no legal moves: just evaluate current state
-        return eval_value_from_root(state, root_player, params, apply_fn)
-
-    best_value = -np.inf
-
-    for S1 in candidate_afterstates:
-        # Evaluate opponent response from state S1
-        opp = -root_player
-        expected = 0.0
-
-        d_idx = 0
-        for r1 in range(1, 7):
-            for r2 in range(1, r1 + 1):
-                dice_opp = np.array([r1, r2], dtype=np.int8)
-                p_roll = 1.0 / 36.0 if r1 == r2 else 2.0 / 36.0
-
-                opp_moves, opp_after = bge._actions(S1, opp, dice_opp)
-                if len(opp_moves) == 0:
-                    # opponent forced pass: leaf is S1
-                    leaf_val = eval_value_from_root(S1, root_player, params, apply_fn)
-                    expected += p_roll * leaf_val
-                    continue
-
-                # Full opponent search (no pruning) but you could apply top_k_moves_by_policy
-                worst_val = np.inf
-                for S2 in opp_after:
-                    v = eval_value_from_root(np.array(S2, dtype=np.int8), root_player, params, apply_fn)
-                    if v < worst_val:
-                        worst_val = v
-
-                expected += p_roll * worst_val
-                d_idx += 1
-
-        if expected > best_value:
-            best_value = expected
-
-    return best_value
-
-# ---------- One PPO rollout over many steps ----------
-
-def rollout_episode_ppo(
-    rng: np.random.Generator,
+def ppo_update(
     train_state: PPOTrainState,
-    max_steps: int = 2048,
-) -> Tuple[ReplayBuffer, float]:
-    """
-    Generate one on-policy trajectory via self-play, storing both players'
-    transitions (canonicalized) in the buffer.
-    - Actions are sampled from the policy over submoves (via pick_action_from_policy).
-    - State values V(S_t) are estimated using a 2-ply, policy-pruned search
-      (two_ply_value_pruned) from the current player's perspective.
-    """
-    rb = ReplayBuffer()
-    total_reward_white = 0.0
-
-    # Start new game
-    player, dice, state = bge._new_game()
-    state = np.array(state, dtype=np.int8)
-    player = int(player)  # +1 or -1
-
-    for t in range(max_steps):
-        # Check for terminal before acting
-        reward_white = float(bge._reward(state, bge.Player(1)))
-        done = (reward_white != 0.0)
-
-        if done:
-            total_reward_white += reward_white
-            break
-
-            # Check legal moves
-        moves, _ = bge._actions(state, player, dice)
-        if len(moves) == 0:
-            # Forced pass: no action taken
-            player = -player
-            dice = bge._roll_dice()
-            continue
-
-        # --------- Choose action from policy ---------
-        # Sample a legal move according to the policy over submoves
-        move, action_flat, logp, _ = pick_action_from_policy(
-            rng, state, player, dice, train_state.params, train_state.apply_fn
-        )
-
-        # Featurize current state from this player's POV for storage
-        board_flat_np, aux_np = encode_state_for_net(state, player)
-
-        # Use pruned 2-ply search to estimate V(S_t) from this player's POV
-        v_two_ply = two_ply_value_pruned(
-            state=state,
-            root_player=player,
-            dice_root=dice,
-            params=train_state.params,
-            apply_fn=train_state.apply_fn,
-            k_root=5,  # can tune this
-        )
-
-        # --------- Environment step ---------
-        next_state = bge._apply_move(state, player, move)
-        next_state = np.array(next_state, dtype=np.int8)
-        next_player = -player
-        next_dice = bge._roll_dice()
-
-        # Reward from WHITE's POV after the move
-        reward_white = float(bge._reward(next_state, bge.Player(1)))
-        done = (reward_white != 0.0)
-
-        # Convert to reward from *current* player's canonical POV
-        reward_canon = reward_white * float(player)
-
-        # Store transition
-        tr = Transition(
-            state=state.copy(),
-            player=player,
-            board_flat=board_flat_np,
-            aux=aux_np,
-            action=action_flat,
-            logp=logp,
-            value=v_two_ply,
-            reward=reward_canon,
-            done=done,
-        )
-        rb.add(tr)
-
-        # Advance
-        state = next_state
-        player = next_player
-        dice = next_dice
-
-        if done:
-            total_reward_white += reward_white
-            # For multi-episode rollouts, you could restart a new game here
-            break
-
-    return rb, total_reward_white
-
-# ---------- PPO training loop over one buffer ----------
-
-def ppo_update_from_buffer(
-    train_state: PPOTrainState,
-    config: PPOConfig,
-    rb: ReplayBuffer,
+    cfg: PPOConfig,
+    rollout: BatchRollout,
 ) -> Tuple[PPOTrainState, Dict[str, float]]:
-    """
-    Run multiple PPO epochs over a single replay buffer.
-    """
-    arrs = rb.as_arrays()
-    rewards = arrs["rewards"]
-    values = arrs["values"]
-    dones = arrs["dones"]
+    # Bootstrap last values
+    last_states = rollout.states[-1]
+    board_flat, aux = encode_batch_for_net(last_states)
+    v_last_jax, _ = model_forward(train_state.params, board_flat, aux)
+    last_values = np.asarray(v_last_jax, dtype=np.float32)
 
-    advantages, returns = compute_gae(
-        rewards, values, dones, config.gamma, config.lam
-    )
+    adv, ret = compute_gae(rollout, last_values, cfg.gamma, cfg.gae_lambda)
 
-    # Prepare big batch as jnp
-    board_flat = jnp.asarray(arrs["board_flat"], dtype=jnp.float32)
-    aux = jnp.asarray(arrs["aux"], dtype=jnp.float32)
-    actions = jnp.asarray(arrs["actions"], dtype=jnp.int32)
-    logp_old = jnp.asarray(arrs["logp"], dtype=jnp.float32)
-    advantages = jnp.asarray(advantages, dtype=jnp.float32)
-    returns = jnp.asarray(returns, dtype=jnp.float32)
+    flat = rollout.as_flat()
+    N = flat["logp_old"].shape[0]
 
-    N = board_flat.shape[0]
-    idx_all = np.arange(N)
+    adv_f = adv.reshape(N)
+    ret_f = ret.reshape(N)
 
-    metrics_accum: Dict[str, float] = {
+    # Advantage normalization
+    adv_mean = float(adv_f.mean())
+    adv_std = float(adv_f.std() + 1e-8)
+    adv_f = (adv_f - adv_mean) / adv_std
+
+    # Chosen first-submove index: from,to -> f*25 + t
+    f0 = flat["submoves"][:, 0, 0].astype(np.int32)
+    t0 = flat["submoves"][:, 0, 1].astype(np.int32)
+    chosen0 = np.full((N,), -1, dtype=np.int32)
+    ok0 = (f0 >= 0) & (t0 >= 0)
+    chosen0[ok0] = f0[ok0] * 25 + t0[ok0]
+
+    idxs = np.arange(N)
+
+    def loss_fn(params: Any, mb: Dict[str, Any]) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+        # Value + policy logits at state0
+        v_pred, logits = model_forward(params, mb["board0"], mb["aux0"])
+        logits_flat = logits.reshape((logits.shape[0], SUBMOVE_GRID))
+
+        mask = jnp.asarray(mb["mask0"], dtype=jnp.float32)
+
+        neg_inf = -1e30
+        masked = jnp.where(mask > 0.5, logits_flat, neg_inf)
+        m = jnp.max(masked, axis=1, keepdims=True)
+        ex = jnp.exp(masked - m) * mask
+        z = jnp.sum(ex, axis=1, keepdims=True) + 1e-9
+        log_soft = (masked - m) - jnp.log(z)
+
+        chosen = jnp.asarray(mb["chosen0"], dtype=jnp.int32)
+        gather = jnp.take_along_axis(
+            log_soft,
+            jnp.clip(chosen[:, None], 0, SUBMOVE_GRID - 1),
+            axis=1,
+        ).squeeze(1)
+        logp_new = jnp.where(chosen >= 0, gather, 0.0)
+
+        # Entropy of legal first-submove distribution
+        p = jnp.exp(log_soft) * mask
+        ps = jnp.sum(p, axis=1, keepdims=True) + 1e-9
+        p = p / ps
+        entropy = jnp.mean(-jnp.sum(p * jnp.where(p > 0, jnp.log(p + 1e-9), 0.0), axis=1))
+
+        # PPO ratio using ONLY first submove logp
+        logp_old = jnp.asarray(mb["logp_old"], dtype=jnp.float32)
+        ratio = jnp.exp(logp_new - logp_old)
+
+        adv_mb = jnp.asarray(mb["adv"], dtype=jnp.float32)
+        unclipped = ratio * adv_mb
+        clipped = jnp.clip(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv_mb
+        pg_loss = -jnp.mean(jnp.minimum(unclipped, clipped))
+
+        ret_mb = jnp.asarray(mb["ret"], dtype=jnp.float32)
+        vf_loss = jnp.mean((v_pred - ret_mb) ** 2)
+
+        loss = pg_loss + cfg.vf_coef * vf_loss - cfg.ent_coef * entropy
+
+        info = {
+            "pg_loss": pg_loss,
+            "vf_loss": vf_loss,
+            "entropy": entropy,
+            "approx_kl": 0.5 * jnp.mean((logp_new - logp_old) ** 2),
+            "ratio_mean": jnp.mean(ratio),
+        }
+        return loss, info
+
+    @jax.jit
+    def train_step(state: PPOTrainState, mb: Dict[str, Any]) -> Tuple[PPOTrainState, Dict[str, jax.Array]]:
+        (loss, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, mb)
+        new_state = state.apply_gradients(grads=grads)
+        info = dict(info)
+        info["loss"] = loss
+        return new_state, info
+
+    info_accum: Dict[str, float] = {
         "loss": 0.0,
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
+        "pg_loss": 0.0,
+        "vf_loss": 0.0,
         "entropy": 0.0,
+        "approx_kl": 0.0,
+        "ratio_mean": 0.0,
     }
-    num_updates = 0
+    n_steps = 0
 
-    for epoch in range(config.num_epochs):
-        np.random.shuffle(idx_all)
-        for start in range(0, N, config.minibatch_size):
-            end = min(start + config.minibatch_size, N)
-            mb_idx = idx_all[start:end]
+    for _ in range(cfg.ppo_epochs):
+        np.random.shuffle(idxs)
+        for start in range(0, N, cfg.minibatch_size):
+            mb_idx = idxs[start : start + cfg.minibatch_size]
+            if len(mb_idx) == 0:
+                continue
 
-            mb = PPOMiniBatch(
-                board_flat=board_flat[mb_idx],
-                aux=aux[mb_idx],
-                actions=actions[mb_idx],
-                logp_old=logp_old[mb_idx],
-                advantages=advantages[mb_idx],
-                returns=returns[mb_idx],
-            )
+            mb_states0 = flat["states"][mb_idx].astype(np.int8)
+            board0, aux0 = encode_batch_for_net(mb_states0)
 
-            train_state, metrics = ppo_update_step(train_state, mb, config)
-            num_updates += 1
-            for k in metrics_accum:
-                metrics_accum[k] += float(metrics[k])
+            mb = {
+                "board0": board0,
+                "aux0": aux0,
+                "mask0": jnp.asarray(flat["mask0"][mb_idx].astype(np.uint8)),
+                "chosen0": jnp.asarray(chosen0[mb_idx].astype(np.int32)),
+                "logp_old": jnp.asarray(flat["logp_old"][mb_idx].astype(np.float32)),
+                "adv": jnp.asarray(adv_f[mb_idx].astype(np.float32)),
+                "ret": jnp.asarray(ret_f[mb_idx].astype(np.float32)),
+            }
 
-    if num_updates > 0:
-        for k in metrics_accum:
-            metrics_accum[k] /= num_updates
+            train_state, info = train_step(train_state, mb)
 
-    return train_state, metrics_accum
+            info_np = {k: float(np.asarray(v)) for k, v in info.items()}
+            for k in info_accum:
+                info_accum[k] += info_np.get(k, 0.0)
+            n_steps += 1
 
-def train_ppo_agent(
-    num_episodes: int = 50,
-    max_steps_per_episode: int = 512,
-    seed: int = 0,
-) -> None:
-    """
-    Simple training driver for PPO Agent 3.
-    - Runs `num_episodes` self-play episodes.
-    - After each episode, runs PPO updates over that episode's buffer.
-    - Prints basic sanity metrics.
-    """
-    # --- RNG setup ---
-    rng = np.random.default_rng(seed)
-    rng_jax = jax.random.PRNGKey(seed)
+    for k in info_accum:
+        info_accum[k] /= max(n_steps, 1)
 
-    # --- PPO config & state ---
-    config = PPOConfig(
-        gamma=0.99,
-        lam=0.95,
-        clip_eps=0.2,
-        value_coef=0.5,
-        entropy_coef=0.01,
-        lr=3e-4,
-        num_epochs=4,
-        minibatch_size=256,
+    logs: Dict[str, float] = dict(info_accum)
+    logs["adv_mean"] = adv_mean
+    logs["adv_std"] = adv_std
+    logs["return_mean"] = float(ret_f.mean())
+    logs["episode_done_rate"] = float(flat["dones"].mean())
+    return train_state, logs
+
+
+# ============================================================
+# Main training loop (vectorized self-play)
+# ============================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_envs", type=int, default=128)
+    parser.add_argument("--steps_per_rollout", type=int, default=256)
+    parser.add_argument("--total_updates", type=int, default=2000)
+    args = parser.parse_args()
+
+    cfg = PPOConfig(
+        num_envs=args.num_envs,
+        steps_per_rollout=args.steps_per_rollout,
     )
-    train_state = create_ppo_train_state(rng_jax, config)
 
-    print("Starting PPO training for Agent 3...")
-    print(f"num_episodes={num_episodes}, max_steps_per_episode={max_steps_per_episode}")
+    rng = np.random.default_rng(cfg.seed)
+    key = jax.random.PRNGKey(cfg.seed)
 
-    for ep in range(num_episodes):
-        # ---- Rollout one on-policy episode ----
-        rb, total_reward_white = rollout_episode_ppo(
-            rng=rng,
-            train_state=train_state,
-            max_steps=max_steps_per_episode,
-        )
+    train_state = make_train_state(key, cfg.lr, cfg.max_grad_norm)
 
-        ep_len = len(rb.data)
+    # Initialize vectorized games
+    x0, x1, x2 = bge._vectorized_new_game(cfg.num_envs)
+    x0 = np.asarray(x0)
+    x1 = np.asarray(x1)
+    x2 = np.asarray(x2)
 
-        # Sanity: skip empty buffer (shouldn't usually happen)
-        if ep_len == 0:
-            print(f"[Episode {ep}] Empty buffer, skipping PPO update.")
-            continue
+    # Dice is the (B,2) array
+    dices = next(x for x in (x0, x1, x2) if x.ndim == 2 and x.shape[1] == 2).astype(np.int8)
 
-        # ---- PPO update over this buffer ----
-        train_state, metrics = ppo_update_from_buffer(
-            train_state=train_state,
-            config=config,
-            rb=rb,
-        )
+    # There may be multiple (B,28) arrays; pick one as the board state
+    state_candidates = [x for x in (x0, x1, x2) if x.ndim == 2 and x.shape[1] == 28]
+    states = np.asarray(state_candidates[0], dtype=np.int8)
 
-        # ---- Basic logging ----
-        avg_value = float(np.mean([tr.value for tr in rb.data]))
-        avg_reward = float(np.mean([tr.reward for tr in rb.data]))
+    # Canonicalize initial states: force player=+1 POV
+    states_canon = np.zeros_like(states)
+    for i in range(cfg.num_envs):
+        states_canon[i] = to_canonical_state(states[i], player=1)
+    states = states_canon
 
-        print(
-            f"[Episode {ep:03d}] "
-            f"len={ep_len:4d}  "
-            f"white_return={total_reward_white:+.3f}  "
-            f"avg_reward(canon)={avg_reward:+.3f}  "
-            f"avg_value={avg_value:+.3f}  "
-            f"loss={metrics['loss']:.4f}  "
-            f"policy_loss={metrics['policy_loss']:.4f}  "
-            f"value_loss={metrics['value_loss']:.4f}  "
-            f"entropy={metrics['entropy']:.4f}"
-        )
+    t0 = time.time()
 
-    print("Training finished.")
+    for update in range(1, args.total_updates + 1):
+        rollout, states, dices = rollout_vectorized(rng, train_state, cfg, states, dices)
+        train_state, logs = ppo_update(train_state, cfg, rollout)
+
+        if update % cfg.log_every == 0:
+            dt = time.time() - t0
+            sps = (cfg.num_envs * cfg.steps_per_rollout * cfg.log_every) / max(dt, 1e-9)
+            t0 = time.time()
+            print(
+                f"[upd {update:5d}] "
+                f"loss={logs['loss']:.4f} pg={logs['pg_loss']:.4f} vf={logs['vf_loss']:.4f} "
+                f"ent={logs['entropy']:.4f} kl={logs['approx_kl']:.6f} "
+                f"ret={logs['return_mean']:.3f} done_rate={logs['episode_done_rate']:.3f} "
+                f"sps={sps:,.0f}"
+            )
 
 
 if __name__ == "__main__":
-    train_ppo_agent(
-        num_episodes=1,          # start small
-        max_steps_per_episode=2 # keep this modest at first
-    )
+    main()
