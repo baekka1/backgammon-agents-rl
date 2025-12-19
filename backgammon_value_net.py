@@ -4,7 +4,6 @@ import flax.linen as nn
 from typing import Tuple
 
 # --- Hyperparameters ---
-INPUT_CHANNELS_PER_PLAYER = 5
 BOARD_LENGTH = 24
 CONV_INPUT_CHANNELS = 15
 AUX_INPUT_SIZE = 6 # 5 Aux + 1 Cube
@@ -123,60 +122,58 @@ class BackgammonValueNet(nn.Module):
 class BackgammonActorCriticNet(nn.Module):
     """
     Shared ResNet backbone + value head + policy head.
-
     Inputs:
-      board_state: (B, BOARD_LENGTH * CONV_INPUT_CHANNELS) float32, flattened 24 x 15 planes
-      aux_features: (B, AUX_INPUT_SIZE) float32
-
+      board_state: (B, 216) float32, flattened 24 x 9 planes
+      aux_features: (B, 6) float32
     Outputs:
-      value: (B,) in [-3, 3]
+      value: (B,)  in [-3, 3]
       policy_logits: (B, 25, 25) raw logits over (source, destination) submoves
     """
-    filters: int = FILTERS
-    num_residual_blocks: int = NUM_RESIDUAL_BLOCKS
-    aux_size: int = AUX_INPUT_SIZE
-
     @nn.compact
     def __call__(self, board_state: jnp.ndarray, aux_features: jnp.ndarray):
-        B = board_state.shape[0]
+        B = board_state.shape[0]  # Batch size
 
-        # (B, 24*15) -> (B, 24, 15)
+        # Reshape to (B, L, C)
         x = board_state.reshape(B, BOARD_LENGTH, CONV_INPUT_CHANNELS)
 
-        # Initial conv (kernel 7) + ReLU
+        # Initial 1D Conv (kernel 7) + ReLU
         x = nn.Conv(
-            features=self.filters,
+            features=FILTERS,
             kernel_size=(7,),
             strides=(1,),
-            padding="SAME",
-            name="initial_conv_7",
+            padding='SAME',
+            name='initial_conv_7'
         )(x)
         x = nn.relu(x)
 
-        # Residual stack
-        for i in range(self.num_residual_blocks):
+        # Stack Residual Blocks
+        for i in range(NUM_RESIDUAL_BLOCKS):
             x = ResidualBlockV2(
-                channels=self.filters,
+                channels=FILTERS,
                 kernel_size=3,
-                name=f"res_block_{i}",
+                name=f'res_block_{i}'
             )(x)
 
-        # Global avg pool over points axis -> (B, filters)
-        x = jnp.mean(x, axis=1)
+        # Global average pool along the 24-point axis
+        x = jnp.mean(x, axis=1)  # Shape (B, 128)
 
-        # Concat aux -> (B, filters + aux_size)
+        # Concatenate auxiliary features -> (B, 134)
         x = jnp.concatenate([x, aux_features], axis=-1)
 
-        # ---- Value head ----
-        v = nn.Dense(features=64, name="value_dense_hidden")(x)
-        v = nn.relu(v)
-        v = nn.Dense(features=1, name="value_output")(v)
-        value = 3.0 * jnp.tanh(v).squeeze(-1)  # (B,)
+        # --- Value Head ---
+        v_hidden = nn.Dense(features=64, name='value_dense_hidden')(x)
+        v_hidden = nn.relu(v_hidden)
+        v_raw = nn.Dense(features=1, name='value_output')(v_hidden)
+        # squash to [-1, 1], then scale to [-3, 3]
+        value = 3.0 * jnp.tanh(v_raw) # Shape (B, 1)
+        value = value.squeeze(-1)    # Shape (B,)
 
-        # ---- Policy head ----
-        p = nn.Dense(features=64, name="policy_dense_hidden")(x)
-        p = nn.relu(p)
-        p = nn.Dense(features=25 * 25, name="policy_output")(p)
-        policy_logits = p.reshape(B, 25, 25)
+        # --- Policy Head ---
+        # Same 134-dim backbone features, separate head
+        p_hidden = nn.Dense(features=64, name='policy_dense_hidden')(x)
+        p_hidden = nn.relu(p_hidden)
+        # 25 x 25 grid of logits for (source, destination)
+        policy_logits = nn.Dense(features=25 * 25, name='policy_output')(p_hidden)
+        policy_logits = policy_logits.reshape(B, 25, 25)  # Shape (B, 25, 25)
 
         return value, policy_logits

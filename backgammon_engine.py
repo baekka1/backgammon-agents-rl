@@ -248,7 +248,7 @@ def _actions(state, current_player, dice):
         all_afterstates.append( state )
 
         return all_moves, all_afterstates
-    
+
     # Player must use maximum number of dice possible
 
     max_dice_used = 0
@@ -308,7 +308,7 @@ def _state_to_tuple(a):
              int8(a[24]), int8(a[25]), int8(a[26]), int8(a[27]) )
 
 @njit
-def _move_afterstate_dict(moves, afterstates):
+def _unique_afterstates(moves, afterstates):
     # takes parallel arrays of moves and afterstates, and constructs a
     # dictionary whose keys are afterstates and whose values are
     # actions (just one) leading to that afterstate. A list of unique
@@ -456,6 +456,7 @@ def _vectorized_actions_parallel(state_vector, player_vector, dice_vector):
 
     return actions, afterstates
 
+
 @njit(parallel=True)
 def _vectorized_apply_move(states, players, move_sequences):
 
@@ -473,12 +474,12 @@ def _collect_search_data( state, player, dice ):
     # tree for batch evaluation by the (neural network) value function
 
     player_moves, player_afterstates = _actions( state, player, dice )
-    afterstate_dict = _move_afterstate_dict( player_moves, player_afterstates )
-    states_buffer = List.empty_list(StateTuple)
-    offsets = np.empty( (len(afterstate_dict), NUM_SORTED_ROLLS), np.int64)
+    afterstates_dict = _unique_afterstates(player_moves, player_afterstates)
+    states_buffer = List.empty_list(state)
+    offsets = np.empty( (len(afterstates_dict), NUM_SORTED_ROLLS), np.int64)
     i = 0
     m = 0
-    for opponent_state in afterstate_dict:
+    for opponent_state in afterstates_dict:
         # convert from tuple back to array
         opponent_state = np.array( opponent_state, dtype=int8 )
         d=0
@@ -491,25 +492,30 @@ def _collect_search_data( state, player, dice ):
                 opponent_moves, opponent_afterstates = _actions( opponent_state,
                                                                  -player,
                                                                  opponent_dice )
-                opponent_afterstates = _move_afterstate_dict( opponent_moves,
-                                                              opponent_afterstates )
-
-                for opponent_afterstate in opponent_afterstates:
-#                    opponent_afterstate = np.array( opponent_afterstate, dtype=int8 )
-                    states_buffer.append(opponent_afterstate)
+                if len(opponent_moves) == 0:
+                    # opponent cannot move; leaf is just opponent_state
+                    states_buffer.append(opponent_state)
                     i += 1
+                else:
+                    opponent_afterstates = _unique_afterstates( opponent_moves,
+                                                            opponent_afterstates )
+                
+                    for opponent_afterstate in opponent_afterstates:
+                        opponent_afterstate = np.array( opponent_afterstate, dtype=int8 )
+                        states_buffer.append(opponent_afterstate)
+                        i += 1
         m += 1
 
-    return states_buffer, offsets, afterstate_dict
+    return states_buffer, offsets, afterstates_dict
 
-@njit #(parallel=True)
-def _select_optimal_move( value_buffer, offsets, afterstate_dict ):
+@njit(parallel=True)
+def _select_optimal_move( values, offsets, afterstate_dict ):
     # receives an array of values for leaves of the 2-ply search and
     # selects the action which maximizes the expected value
 
     afterstates = list(afterstate_dict)
-    move_expected_values = np.zeros( len(afterstate_dict), np.float32 )
-
+    move_expected_values = np.zeros( len(afterstates), np.float64 )
+    
     for m in prange(len(afterstates)):
         d=0
         for r1 in range(1,7):
@@ -522,8 +528,8 @@ def _select_optimal_move( value_buffer, offsets, afterstate_dict ):
                     if m < len(afterstates) - 1:
                         end_index = offsets[ m+1, 0]
                     else:
-                        end_index = len(value_buffer)
-                minv = np.min( value_buffer[ start_index : end_index ] )
+                        end_index = len(values)
+                minv = np.min( values[ start_index : end_index ] )
                 move_expected_values[m] += p * minv
                 d = d + 1
 
@@ -790,7 +796,7 @@ def _vectorized_2_ply_search_epsilon_greedy( states, players, dices, batch_value
 def _linear_batch_value_function( feature_function, weights, states ):
 
     batch_size = len(states)
-
+    
     values = np.empty( batch_size )
     
     for i in prange( batch_size ):
