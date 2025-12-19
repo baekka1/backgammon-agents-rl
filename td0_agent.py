@@ -536,6 +536,8 @@ def play_one_game_td0(weights: np.ndarray,
         # Transition to next step or terminate
         if terminal:
             # Game over; return final outcome from white's perspective
+            winner = "WHITE" if reward_white > 0 else "BLACK"
+            print(f"[GAME OVER] winner={winner} reward_white={reward_white:+.1f} steps={step}", flush=True)
             return reward_white, step
         
         # Continue game
@@ -569,6 +571,8 @@ def play_batch_td0(weights: np.ndarray,
     global GAMMA, ALPHA
     GAMMA = gamma
     ALPHA = alpha
+
+    win_counts = {"WHITE": 0, "BLACK": 0}
 
     # --- Initialize batch of games using the engine's vectorized new_game ---
     state_vector, player_vector, dice_vector = bge._vectorized_new_game(batch_size)
@@ -613,6 +617,10 @@ def play_batch_td0(weights: np.ndarray,
                 terminal = (reward_white != 0)
 
                 if terminal:
+                    winner = "WHITE" if reward_white > 0 else "BLACK"
+                    win_counts[winner] += 1
+                    print(f"[FINISH] game={total_finished+1} slot={i} winner={winner} reward_white={reward_white:+.1f} (forced-pass)", flush=True)
+
                     # Terminal on a forced pass: do a terminal transition
                     rewards[i] = float(reward_white)
                     terminals[i] = True
@@ -652,6 +660,10 @@ def play_batch_td0(weights: np.ndarray,
             next_states[i] = s_next
 
             if terminal:
+                winner = "WHITE" if reward_white > 0 else "BLACK"
+                win_counts[winner] += 1
+                print(f"[FINISH] game={total_finished+1} slot={i} winner={winner} reward_white={reward_white:+.1f}", flush=True)
+                
                 total_finished += 1
                 # Immediately start a new game in this slot
                 new_player, new_dice, new_state = bge._new_game()
@@ -685,7 +697,7 @@ def play_batch_td0(weights: np.ndarray,
 if __name__ == "__main__":
     weights = init_weights()
     result = play_batch_td0(weights,
-                            batch_size=32,
+                            batch_size=5,
                             num_batches=100,
                             alpha=1e-3,
                             gamma=1.0)
